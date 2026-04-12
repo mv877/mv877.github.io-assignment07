@@ -1,0 +1,104 @@
+---
+title: "assignment07"
+author: "Sarah Krause and Miguel Villa"
+format: html
+editor: visual
+embed-resources: true
+---
+
+# Set up
+
+Read in the data
+
+```{r}
+library(tidyverse)
+library(here)
+library(tidymodels)
+
+data <- read.csv(here("data/assignment_modeling.csv"))
+```
+
+## Split the data
+
+```{r}
+set.seed(20260412)
+# Place 80% of the data in the training data
+split <- initial_split(data, prop = 0.8)
+
+# Obtain the training data
+train_data <- training(split)
+```
+
+## EDA on the training data
+
+```{r}
+# Glimpse the training data
+glimpse(train_data)
+
+# Examine the distribution of the outcome variable 
+train_data |>
+  ggplot(aes(x = non_return_rate)) +
+  geom_histogram()
+```
+
+## Set up cross-validation
+
+```{r}
+# 5 fold cross-validation
+folds <- vfold_cv(train_data, v = 5)
+```
+
+\*Note to Miguel: when I tried to run the random forest model with 5 fold cross validation without parallelization, it took a very long time to run - I ended up quitting and restarting to see if we can make changes to either the number of folds, adding parallelization, or making some other change to save computation time.
+
+# Predictive Modeling
+
+## Model 1: Parametric
+
+## Model 2: Non-parametric
+
+## Model 3: Random forest (ensembling)
+
+For our third model, we have selected random forest, an ensembling approach. We tune the hyperparameters *min_n*, the minimum number of data points required in a node before further splitting, and *mtry*, the number of predcitors considered at each split. We use 200 trees.
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+model3_rec <- recipe(non_return_rate ~ ., data = train_data) |>
+  add_role(GIDTR, State_name, County_name, new_role = "id") |>
+  step_rm(has_role("id"))
+
+# Model
+model3_mod <- rand_forest(min_n = tune(),
+                          mtry = tune(),
+                          trees = 200) |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "ranger",
+             importance = "impurity",
+             num.threads = 4)
+
+# Workflow
+model3_wf <- workflow() |>
+  add_recipe(model3_rec) |>
+  add_model(model3_mod)
+
+# Tuning grid 
+model3_grid <- grid_regular(
+  mtry(range = c(1, 15)),
+  min_n(range = c(1, 15)),
+  levels = 5
+)
+
+# Resamples
+model3_resamples <- tune_grid(
+  model3_wf,
+  resamples = folds,
+  grid = model3_grid
+)
+
+# Collect metrics
+collect_metrics(model3_resamples)
+
+# Plot
+autoplot(model3_resamples)
+```
