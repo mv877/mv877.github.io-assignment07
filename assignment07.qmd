@@ -58,7 +58,14 @@ folds <- vfold_cv(train_data, v = 5)
 
 ## Model 3: Random forest (ensembling)
 
-For our third model, we have selected random forest, an ensembling approach. We tune the hyperparameters *min_n*, the minimum number of data points required in a node before further splitting, and *mtry*, the number of predcitors considered at each split. We use 200 trees.
+For our third model, we have selected random forest, an ensembling approach. We tune the hyperparameters *min_n*, the minimum number of data points required in a node before further splitting, and *mtry*, the number of predictors considered at each split using the latin hypercube tuning grid to save computation time. For *min_n*, we tune over a range of 5 to 40 data points required in a node before further splitting. For *mtry,* we tune over a range of 5 to 50 predictors to be considered at each split. During tuning, we use 100 trees. The number of trees will be increased to between 200-500 for final model fitting. We also use parallelization to reduce computation time.
+
+```{r}
+# Set up parallelization
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+```
 
 ```{r}
 set.seed(20260412)
@@ -71,29 +78,32 @@ model3_rec <- recipe(non_return_rate ~ ., data = train_data) |>
 # Model
 model3_mod <- rand_forest(min_n = tune(),
                           mtry = tune(),
-                          trees = 200) |>
+                          trees = 100) |>
   set_mode(mode = "regression") |>
   set_engine(engine = "ranger",
              importance = "impurity",
-             num.threads = 4)
+             num.threads = parallel::detectCores() - 1)
 
 # Workflow
 model3_wf <- workflow() |>
   add_recipe(model3_rec) |>
   add_model(model3_mod)
 
-# Tuning grid 
-model3_grid <- grid_regular(
-  mtry(range = c(1, 15)),
-  min_n(range = c(1, 15)),
-  levels = 5
+# Tuning grid
+model3_grid <- grid_space_filling(
+  mtry(range = c(5, 50)),
+  min_n(range = c(5, 40)),
+  size = 20
 )
+```
 
+```{r}
 # Resamples
 model3_resamples <- tune_grid(
   model3_wf,
   resamples = folds,
-  grid = model3_grid
+  grid = model3_grid,
+  control = control_grid(parallel_over = "everything")
 )
 
 # Collect metrics
@@ -101,4 +111,17 @@ collect_metrics(model3_resamples)
 
 # Plot
 autoplot(model3_resamples)
+```
+
+```{r}
+# Time a single fold of a single combination
+library(tictoc)
+tic()
+tune_grid(
+  model3_wf,
+  resamples = folds[1, ],
+  grid = model3_grid[1, ],  # just one combination
+  control = control_grid()
+)
+toc()
 ```
