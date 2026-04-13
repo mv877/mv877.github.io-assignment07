@@ -14,6 +14,9 @@ Read in the data
 library(tidyverse)
 library(here)
 library(tidymodels)
+library(skimr)
+library(janitor)
+library(corrplot)
 
 data <- read.csv(here("data/assignment_modeling.csv"))
 ```
@@ -31,14 +34,66 @@ train_data <- training(split)
 
 ## EDA on the training data
 
-```{r}
-# Glimpse the training data
-glimpse(train_data)
+### Basic Overview
 
-# Examine the distribution of the outcome variable 
+```{r}
+# Check Names
+names(train_data)
+
+# Glimpse the training data
+glimpse(train_data) # we will have to remove this characters Aggregate_HH_INC_ACS_13_17, avg_Agg_HH_INC_ACS_13_17, Aggr_House_Value_ACS_13_17
+
+# structure 
+str(train_data)
+
+# missingness
+tibble(variable = names(train_data),
+       pct_missing = colMeans(is.na(train_data)) * 100) |>
+  arrange(desc(pct_missing))
+```
+
+### Outcome Variable
+
+```{r}
+# Basic Distribution of non_return_rate
+summary(train_data$non_return_rate)
+
+# Non Missing of non_return_rate
+skim(train_data$non_return_rate)
+
+# Examine the distribution of the outcome variable (non_return_rate)
 train_data |>
   ggplot(aes(x = non_return_rate)) +
-  geom_histogram()
+  geom_histogram() +
+  theme_minimal()
+
+# State Frequency
+train_data |>
+  group_by(State_name) |>
+  summarize(average_non = mean(non_return_rate),
+            count = n()) |>
+  arrange(desc(average_non))
+```
+
+### Potentially Highly Correlated Relationships
+
+```{r}
+train_data |>
+  ggplot(aes(x = non_return_rate, y = Low_Response_Score)) +
+  geom_point(alpha = 0.25) +
+  theme_minimal()
+
+train_data |>
+  ggplot(aes(x = non_return_rate, y = Renter_Occp_HU_ACS_13_17)) +
+  geom_point(alpha = 0.25) +
+  theme_minimal()
+```
+
+### Correlations
+
+```{r}
+corrplot(train_data)
+
 ```
 
 ## Set up cross-validation
@@ -48,11 +103,92 @@ train_data |>
 folds <- vfold_cv(train_data, v = 5)
 ```
 
+```{r}
+library(doParallel)
+cl <- makeCluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+```
+
 \*Note to Miguel: when I tried to run the random forest model with 5 fold cross validation without parallelization, it took a very long time to run - I ended up quitting and restarting to see if we can make changes to either the number of folds, adding parallelization, or making some other change to save computation time.
 
 # Predictive Modeling
 
 ## Model 1: Parametric
+
+### Plain Vanilla Linear Regression
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score, Aggregate_HH_INC_ACS_13_17, 
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17) |> # remove the problematic fact 
+  step_impute_median(all_numeric_predictors()) 
+
+# Mode
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+model0_resamples <- model0_wf |>
+  fit_resamples(resamples = folds)
+
+model0_resamples |>
+  collect_metrics()
+```
+
+### Elastic Net
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score, Aggregate_HH_INC_ACS_13_17, 
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17) |> # remove the problematic fact 
+  step_impute_median(all_numeric_predictors()) 
+
+
+# Mode
+model1_mode <- linear_reg(penalty = tune(), mixture = tune()) |> # works best for many variables 
+  set_mode(mode = "regression") |>
+  set_engine(engine = "glmnet") 
+
+# Workflow
+model1_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model1_mode)
+
+# resamples
+model1_grid <- grid_regular(
+  penalty(), 
+  mixture(),
+  levels = 20
+)
+
+model1_tuning <- tune_grid(
+  model1_wf,
+  resamples = folds,
+  grid = model1_grid
+)
+
+show_best(model1_tuning)
+```
 
 ## Model 2: Non-parametric
 
@@ -79,7 +215,7 @@ model3_mod <- rand_forest(min_n = tune(),
 
 # Workflow
 model3_wf <- workflow() |>
-  add_recipe(model3_rec) |>
+  add_recipe(model1_rec) |>
   add_model(model3_mod)
 
 # Tuning grid 
