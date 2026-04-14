@@ -10,10 +10,17 @@ embed-resources: true
 
 Read in the data
 
-```{r}
+```{r message=FALSE, warning=FALSE}
+options(scipen = 999)
+
 library(tidyverse)
 library(here)
 library(tidymodels)
+library(skimr)
+library(janitor)
+library(corrplot)
+library(tictoc)
+library(vip)
 
 data <- read.csv(here("data/assignment_modeling.csv"))
 ```
@@ -31,15 +38,159 @@ train_data <- training(split)
 
 ## EDA on the training data
 
-```{r}
-# Glimpse the training data
-glimpse(train_data)
+### Basic Overview
 
-# Examine the distribution of the outcome variable 
+```{r}
+# Check Names
+names(train_data)
+
+# Glimpse the training data
+glimpse(train_data) # we will have to remove this characters Aggregate_HH_INC_ACS_13_17, avg_Agg_HH_INC_ACS_13_17, Aggr_House_Value_ACS_13_17
+
+# structure 
+str(train_data)
+
+# missingness
+tibble(variable = names(train_data),
+       pct_missing = colMeans(is.na(train_data)) * 100) |>
+  arrange(desc(pct_missing))
+```
+
+### Outcome Variable
+
+```{r}
+# Basic Distribution of non_return_rate
+summary(train_data$non_return_rate)
+
+# Non Missing of non_return_rate
+skim(train_data$non_return_rate)
+
+# Examine the distribution of the outcome variable (non_return_rate)
 train_data |>
   ggplot(aes(x = non_return_rate)) +
-  geom_histogram()
+  geom_histogram() +
+  labs(title = "Distribution of Non Return Rate") +
+  theme_minimal()
+
+train_data |> 
+  skewness(non_return_rate)
+# State Frequency
+train_data |>
+  group_by(State_name) |>
+  summarize(average_non = mean(non_return_rate),
+            count = n(),
+            pct_obs = count / nrow(train_data) * 100) |>
+  arrange(pct_obs)
 ```
+
+### Transformations
+```{r}
+train_data |>
+  mutate(
+    raw_non   = non_return_rate,
+    log_non = log(non_return_rate + 0.001),
+    logit_non = log(non_return_rate/ (1 - non_return_rate + 0.001))) |>
+  pivot_longer(c(raw_non, log_non, logit_non)) |>
+  ggplot(aes(x = value)) +
+    geom_histogram() +
+    facet_wrap(~name, scales = "free") +
+    labs(title = "Non Return Rate Transformations") +
+    theme_minimal()
+
+```
+Will explore log transformation of non_return_rate. There are also other variables, in particular the income, home value, and population variables which could benefit from a log. 
+
+These are
+Population: Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17, Pop_under_5_CEN_2010, Pop_18_24_CEN_2010
+Value: Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17
+Otherss: pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17,
+pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17,
+pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010,
+pct_No_Plumb_ACS_13_17
+
+
+### Correlations
+Target Correlation: 
+Typically you better features (non-target variables) that are highly correlated with target variables as they provide more predictive power.
+```{r}
+numeric_vars <- train_data |>
+  select(where(is.numeric), -non_return_rate)
+
+# find correlations
+correlations <- cor(numeric_vars, train_data$non_return_rate, use = "complete.obs") 
+  
+# Convert to dataframe and sort
+non_cor <- data_frame(
+  variable = rownames(correlations),
+  correlation = (correlations)) |>
+  arrange(desc(abs(correlation)))
+
+non_cor
+
+```
+One potential issue is a lot of these variables measure the same thing just in different survey (pct_NH_White_alone_CEN_2010, pct_NH_White_alone_ACS_13_17)	
+
+Feature Correlation:
+One potential issue can be when features (non-target variables) are highly correlated with one another. As one example percentage of families that speak tagalog and spanish may both contribute similar information to our model, and inclusion of both can lead to overfitting and make our estimates less stable. This issue doesn't matter as much for regularized models but does for regular regression. 
+```{r}
+corr_mat <- cor(numeric_vars, use = "pairwise.complete.obs")
+
+# distance based
+dist_mat <- as.dist(1 - abs(corr_mat))
+
+# hierarchical clustering
+hc <- hclust(dist_mat, method = "average")
+
+plot(hc, labels = FALSE, main = "Correlation Clusters")
+
+# Id'ing cluster
+clusters <- cutree(hc, h = 0.15)   # 1 - .85
+table(clusters)
+```
+Cluster 7 seems like its the biggest issue but there are a few blocks of collinearity
+```{r}
+# Now ill attach cluster numbers to each variable
+cluster_df <- data.frame(
+  variable = names(numeric_vars),
+  cluster  = clusters
+)
+
+representatives <- cluster_df |>
+  group_by(cluster) |>
+  slice(1) |> 
+  pull(variable)
+
+vars_to_drop <- setdiff(cluster_df$variable, representatives)
+
+vars_to_drop
+
+```
+Way too many correlated features to even begin to count. I will approach this issue by creating clusters and picking representative variables by cluster. 
+```{r}
+library(igraph)
+
+# adjacency matrix for |r| > .85
+adj <- abs(corr_mat) > 0.85
+diag(adj) <- FALSE
+
+g <- graph_from_adjacency_matrix(adj, mode = "undirected")
+
+components <- components(g)
+sizes <- components$csize
+
+sizes
+
+```
+
+
+
+
+PCA can help us look for clustering of features that introduce redundancy into prediction. Basically it'll reduce redundant variables into one component. All i have to add is: 
+
+step_normalize(all_numeric_predictors()) |>
+step_pca(all_numeric_predictors(), num_comp = tune())
+
+### Potentially Highly Correlated Relationships
 
 ## Set up cross-validation
 
@@ -48,34 +199,245 @@ train_data |>
 folds <- vfold_cv(train_data, v = 5)
 ```
 
+```{r}
+library(doParallel)
+cl <- makeCluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+```
+
 \*Note to Miguel: when I tried to run the random forest model with 5 fold cross validation without parallelization, it took a very long time to run - I ended up quitting and restarting to see if we can make changes to either the number of folds, adding parallelization, or making some other change to save computation time.
 
 # Predictive Modeling
 
 ## Model 1: Parametric
 
+### Plain Vanilla Linear Regression
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score,
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          Self_Response_Rate_ACS_13_17,
+          pct_TEA_Update_Leave_CEN_2010) |> # removing census duplicated vars
+  step_rm(all_of(vars_to_drop)) |>
+  step_impute_median(all_numeric_predictors())
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+model0_resamples <- model0_wf |>
+  fit_resamples(resamples = folds)
+
+model0_resamples |>
+  collect_metrics()
+
+
+```
+
+```{r}
+# Variable importance
+model0_final <- model0_wf |>
+  last_fit(split) 
+
+model0_final |>
+  extract_fit_parsnip() |>
+  vip(num_features = 20) 
+
+## Extracting the most important for later use 
+fit <- model0_final |> 
+  extract_fit_parsnip()
+
+imp_tbl <- vi(fit)
+
+# sort by absolute importance
+imp_tbl <- imp_tbl |> arrange(desc(abs(Importance)))
+
+# convert to a vector of variable names
+top_vars <- imp_tbl$Variable[1:20]
+
+top_vars
+
+top_vars_clean <- intersect(top_vars, names(train_data))
+```
+
+
+### With transformations
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score,
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          Self_Response_Rate_ACS_13_17) |> # remove the problematic vars (chr) 
+  step_log(non_return_rate, offset = 1e-6) |>
+  step_log(Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17, offset = 1) |>
+  step_log(Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17, offset = 1) |>
+  step_log(pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17,
+           pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17,
+           pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010,
+           pct_No_Plumb_ACS_13_17, offset = 1e-6) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) 
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+model0_resamples <- model0_wf |>
+  fit_resamples(resamples = folds)
+
+model0_resamples |>
+  collect_metrics()
+
+model0_final <- model0_wf |>
+  last_fit(split) |>
+  collect_metrics()
+
+```
+
+### Linear Regression with PCA, given the large number of vars. 
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score,
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          Self_Response_Rate_ACS_13_17) |> # remove the problematic vars (chr) 
+  step_impute_median(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = tune())
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+# adding in pca grid 
+pca_grid <- grid_regular(
+  num_comp(range = c(50, 150)),
+  levels = 10)
+
+model0_resamples <- tune_grid(
+  model0_wf,
+  resamples = folds,
+  grid = pca_grid)
+
+model0_resamples |>
+  collect_metrics()
+
+
+
+```
+
+### Elastic Net
+
+```{r}
+set.seed(20260412)
+
+# Mode
+model1_mode <- linear_reg(penalty = tune(), mixture = tune()) |> # works best for many variables 
+  set_mode(mode = "regression") |>
+  set_engine(engine = "glmnet") 
+
+# Workflow
+model1_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model1_mode)
+
+# resamples
+model1_grid <- grid_regular(
+  penalty(), 
+  mixture(),
+  levels = 20
+)
+
+model1_tuning <- tune_grid(
+  model1_wf,
+  resamples = folds,
+  grid = model1_grid
+)
+
+show_best(model1_tuning)
+
+# Finalize workflow
+model1_best <- select_best(model1_tuning, metric = "rmse")
+
+
+model1_final_wf <- finalize_workflow(
+  model1_wf,
+  model1_best)
+
+# Variable importance
+model1_fit <- fit(model1_final_wf, data = train_data)
+
+model1_fit |>
+  extract_fit_parsnip() |>
+  vip(num_features = 20) 
+```
+
 ## Model 2: Non-parametric
 
 ## Model 3: Random forest (ensembling)
 
 For our third model, we have selected random forest, an ensembling approach. We tune the hyperparameters *min_n*, the minimum number of data points required in a node before further splitting, and *mtry*, the number of predcitors considered at each split. We use 200 trees.
-
 ```{r}
 set.seed(20260412)
+tic()
 
 # Recipe
-model3_rec <- recipe(non_return_rate ~ ., data = train_data) |>
-  add_role(GIDTR, State_name, County_name, new_role = "id") |>
-  step_rm(has_role("id"))
+model3_rec <- recipe(non_return_rate ~ ., data = train_data1) |>
+  update_role(State_name, County_name, Low_Response_Score, new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010,
+          Aggr_House_Value_ACS_13_17,
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17,
+          Aggregate_HH_INC_ACS_13_17,
+          Self_Response_Rate_ACS_13_17) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_select(top_vars)
 
 # Model
 model3_mod <- rand_forest(min_n = tune(),
                           mtry = tune(),
-                          trees = 200) |>
+                          trees = 100) |>
   set_mode(mode = "regression") |>
   set_engine(engine = "ranger",
              importance = "impurity",
-             num.threads = 4)
+             num.threads = parallel::detectCores() - 1) # parallelization
 
 # Workflow
 model3_wf <- workflow() |>
@@ -83,22 +445,63 @@ model3_wf <- workflow() |>
   add_model(model3_mod)
 
 # Tuning grid 
-model3_grid <- grid_regular(
-  mtry(range = c(1, 15)),
-  min_n(range = c(1, 15)),
-  levels = 5
-)
+model3_grid <- grid_space_filling(
+  mtry(range = c(5, 50)),
+  min_n(range = c(5, 40)),
+  size = 12)
 
 # Resamples
 model3_resamples <- tune_grid(
   model3_wf,
   resamples = folds,
-  grid = model3_grid
+  grid = model3_grid,
+  control = control_grid(parallel_over = "everything")
 )
 
 # Collect metrics
 collect_metrics(model3_resamples)
+```
 
-# Plot
-autoplot(model3_resamples)
+Model 2 (with only the best fits from earlier )
+```{r}
+set.seed(20260412)
+tic()
+train_data1 <- train_data |>
+  select(non_return_rate, all_of(top_vars_clean)) 
+
+# Recipe
+model4_rec <- recipe(non_return_rate ~ ., data = train_data1) |>
+  step_impute_median(all_numeric_predictors()) 
+
+# Model
+model4_mod <- rand_forest(min_n = tune(),
+                          mtry = tune(),
+                          trees = 100) |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "ranger",
+             importance = "impurity",
+             num.threads = parallel::detectCores() - 1) # parallelization
+
+# Workflow
+model4_wf <- workflow() |>
+  add_recipe(model4_rec) |>
+  add_model(model4_mod)
+
+# Tuning grid 
+model4_grid <- grid_space_filling(
+  mtry(range = c(5, 50)),
+  min_n(range = c(5, 40)),
+  size = 20)
+
+# Resamples
+model4_resamples <- tune_grid(
+  model4_wf,
+  resamples = folds,
+  grid = model4_grid,
+  control = control_grid(parallel_over = "everything")
+)
+
+# Collect metrics
+collect_metrics(model4_resamples)
+
 ```
