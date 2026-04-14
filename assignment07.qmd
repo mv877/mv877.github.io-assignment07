@@ -8,7 +8,7 @@ embed-resources: true
 
 # Set up
 
-Read in the data
+Read in the data and load libraries
 
 ```{r message=FALSE, warning=FALSE}
 options(scipen = 999)
@@ -59,6 +59,11 @@ tibble(variable = names(train_data),
 ### Outcome Variable
 
 ```{r}
+# Basic Distribution of non_return_rate 
+summary(train_data$non_return_rate)
+
+
+```{r}
 # Basic Distribution of non_return_rate
 summary(train_data$non_return_rate)
 
@@ -69,6 +74,8 @@ skim(train_data$non_return_rate)
 train_data |>
   ggplot(aes(x = non_return_rate)) +
   geom_histogram() +
+  theme_minimal()
+
   labs(title = "Distribution of Non Return Rate") +
   theme_minimal()
 
@@ -78,6 +85,58 @@ train_data |>
 train_data |>
   group_by(State_name) |>
   summarize(average_non = mean(non_return_rate),
+            count = n()) |>
+  arrange(desc(average_non))
+```
+
+### Look for variables highly correlated with outcome variable
+
+```{r}
+# Get correlation of numeric predictors with outcome variable
+correlations <- train_data |>
+  select(where(is.numeric)) |>
+  cor(use = "pairwise.complete.obs")
+
+# Extract just the correlations with the outcome
+outcome_cors <- correlations[, "non_return_rate"]
+
+# Sort in order of highest correlations
+outcome_cors_sorted <- sort(abs(outcome_cors), decreasing = TRUE)
+
+# Keep only correlations of 0.5 or higher
+outcome_cors_filtered <- outcome_cors_sorted[outcome_cors_sorted >= 0.5]
+
+outcome_cors_filtered
+```
+
+\*Note to Miguel: It seems like low_response score and self_response_rate could be really similar to our outcome variable. Should we remove them to prevent data leakage?
+
+### Visualize the correlations
+
+```{r}
+train_data |>
+  ggplot(aes(x = non_return_rate, y = Low_Response_Score)) +
+  geom_point(alpha = 0.25) +
+  theme_minimal()
+
+train_data |>
+  ggplot(aes(x = non_return_rate, y = Renter_Occp_HU_ACS_13_17)) +
+  geom_point(alpha = 0.25) +
+  theme_minimal()
+
+train_data |>
+  ggplot(aes(x = non_return_rate, y = Self_Response_Rate_ACS_13_17)) +
+  geom_point(alpha = 0.25) +
+  theme_minimal()
+```
+
+```{r}
+corrplot(train_data)
+```
+
+\*Miguel: I got an error with the corrplot function
+
+## Set up cross-validation and parallelization
             count = n(),
             pct_obs = count / nrow(train_data) * 100) |>
   arrange(pct_obs)
@@ -183,6 +242,11 @@ folds <- vfold_cv(train_data, v = 5)
 ```
 
 ```{r}
+# Set up parallelization
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+```
 library(doParallel)
 cl <- makeCluster(parallel::detectCores() - 1)
 registerDoParallel(cl)
@@ -192,7 +256,93 @@ registerDoParallel(cl)
 
 # Predictive Modeling
 
-## Model 1: Parametric
+## Model 1: Linear regression (parametric)
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score, Aggregate_HH_INC_ACS_13_17, 
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17,
+          Self_Response_Rate_ACS_13_17) |> # remove the problematic fact 
+  step_impute_median(all_numeric_predictors()) 
+
+# Mode
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+model0_resamples <- model0_wf |>
+  fit_resamples(resamples = folds)
+
+model0_resamples |>
+  collect_metrics()
+```
+
+\*Miguel - why did you remove Aggregate_HH_INC_ACS_13_17
+
+```{r}
+# Variable importance
+model0_final <- model0_wf |>
+  last_fit(split) 
+
+model0_final |>
+  extract_fit_parsnip() |>
+  vip(num_features = 20) 
+```
+
+### Elastic Net
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score, Aggregate_HH_INC_ACS_13_17, 
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17) |> # remove the problematic fact 
+  step_impute_median(all_numeric_predictors()) 
+
+
+# Mode
+model1_mode <- linear_reg(penalty = tune(), mixture = tune()) |> # works best for many variables 
+  set_mode(mode = "regression") |>
+  set_engine(engine = "glmnet") 
+
+# Workflow
+model1_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model1_mode)
+
+# resamples
+model1_grid <- grid_regular(
+  penalty(), 
+  mixture(),
+  levels = 20
+)
+
+model1_tuning <- tune_grid(
+  model1_wf,
+  resamples = folds,
+  grid = model1_grid
+)
+
+show_best(model1_tuning)
+```
 
 ### Plain Vanilla Linear Regression
 ```{r}
@@ -433,12 +583,33 @@ model1_fit |>
 
 ## Model 3: Random forest (ensembling)
 
+For our third model, we have selected random forest, an ensembling approach. We tune the hyperparameters *min_n*, the minimum number of data points required in a node before further splitting, and *mtry*, the number of predictors considered at each split using the latin hypercube tuning grid to save computation time. For *min_n*, we tune over a range of 5 to 40 data points required in a node before further splitting. For *mtry,* we tune over a range of 5 to 50 predictors to be considered at each split. During tuning, we use 100 trees. The number of trees will be increased to between 200-500 for final model fitting. We also use parallelization to reduce computation time.
+
+In the recipe, several variables are removed, as well as variables with low variance and high correlation with each other. These steps reduce redundancy and also save computation time. We also use 3-fold cross-validation instead of 5-fold cross-validation.
+
+```{r}
+# 3 fold cross validation
+threefold <- vfold_cv(train_data, v = 3)
+```
+
 For our third model, we have selected random forest, an ensembling approach. We tune the hyperparameters *min_n*, the minimum number of data points required in a node before further splitting, and *mtry*, the number of predcitors considered at each split. We use 200 trees.
 ```{r}
 set.seed(20260412)
 tic()
 
 # Recipe
+model3_rec <- recipe(non_return_rate ~ ., data = train_data) |>
+  add_role(GIDTR, State_name, County_name, new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, # remove the problematic fact 
+          Low_Response_Score,
+          Self_Response_Rate_ACS_13_17) |> 
+  step_impute_median(all_numeric_predictors()) |>
+  step_nzv(all_predictors()) |> # remove predictors with low variance
+  step_corr(allpredictors(), threshold = 0.9) # remove predictors 90% correlated with each other
 model3_rec <- recipe(non_return_rate ~ ., data = train_data1) |>
   update_role(State_name, County_name, Low_Response_Score, new_role = "id") |>
   step_rm(has_role("id"),
@@ -452,7 +623,7 @@ model3_rec <- recipe(non_return_rate ~ ., data = train_data1) |>
   step_select(top_vars)
 
 # Model
-model3_mod <- rand_forest(min_n = tune(),
+model3_mod <- rand_forest(min_n = tune(), # hyperparameter tuning
                           mtry = tune(),
                           trees = 100) |>
   set_mode(mode = "regression") |>
@@ -465,16 +636,17 @@ model3_wf <- workflow() |>
   add_recipe(model3_rec) |>
   add_model(model3_mod)
 
-# Tuning grid 
+# Tuning grid
 model3_grid <- grid_space_filling(
   mtry(range = c(5, 50)),
   min_n(range = c(5, 40)),
-  size = 12)
+  size = 20
+)
 
 # Resamples
 model3_resamples <- tune_grid(
   model3_wf,
-  resamples = folds,
+  resamples = threefold,
   grid = model3_grid,
   control = control_grid(parallel_over = "everything")
 )
@@ -525,4 +697,7 @@ model4_resamples <- tune_grid(
 # Collect metrics
 collect_metrics(model4_resamples)
 
+# Plot
+autoplot(model3_resamples)
+toc()
 ```
