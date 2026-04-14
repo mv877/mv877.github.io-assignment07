@@ -147,13 +147,13 @@ plot(hc, labels = FALSE, main = "Correlation Clusters")
 clusters <- cutree(hc, h = 0.15)   # 1 - .85
 table(clusters)
 ```
+Way too many correlated features to even begin to count. I will approach this issue by creating clusters and picking representative variables by cluster. 
 Cluster 7 seems like its the biggest issue but there are a few blocks of collinearity
 ```{r}
 # Now ill attach cluster numbers to each variable
 cluster_df <- data.frame(
   variable = names(numeric_vars),
-  cluster  = clusters
-)
+  cluster  = clusters)
 
 representatives <- cluster_df |>
   group_by(cluster) |>
@@ -165,23 +165,6 @@ vars_to_drop <- setdiff(cluster_df$variable, representatives)
 vars_to_drop
 
 ```
-Way too many correlated features to even begin to count. I will approach this issue by creating clusters and picking representative variables by cluster. 
-```{r}
-library(igraph)
-
-# adjacency matrix for |r| > .85
-adj <- abs(corr_mat) > 0.85
-diag(adj) <- FALSE
-
-g <- graph_from_adjacency_matrix(adj, mode = "undirected")
-
-components <- components(g)
-sizes <- components$csize
-
-sizes
-
-```
-
 
 
 
@@ -225,9 +208,10 @@ model1_rec <- recipe(non_return_rate ~ ., train_data) |>
           avg_Agg_House_Value_ACS_13_17, 
           Aggregate_HH_INC_ACS_13_17,
           Self_Response_Rate_ACS_13_17,
-          pct_TEA_Update_Leave_CEN_2010) |> # removing census duplicated vars
-  step_rm(all_of(vars_to_drop)) |>
+          pct_TEA_Update_Leave_CEN_2010) |> # high missingness
   step_impute_median(all_numeric_predictors())
+
+prep(model1_rec) |> juice() |> names()
 
 model0_mod <- linear_reg() |>
   set_mode(mode = "regression") |>
@@ -272,6 +256,40 @@ top_vars
 top_vars_clean <- intersect(top_vars, names(train_data))
 ```
 
+### Trying to remove redundant features
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score,
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          Self_Response_Rate_ACS_13_17) |> # removing census duplicated vars
+  step_rm(all_of(vars_to_drop)) |> # removing highly correlated vars
+  step_impute_median(all_numeric_predictors())
+
+prep(model1_rec) |> juice() |> names()
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+model0_resamples <- model0_wf |>
+  fit_resamples(resamples = folds)
+
+model0_resamples |>
+  collect_metrics()
+```
+Didn't really do anything lol
 
 ### With transformations
 ```{r}
@@ -282,21 +300,22 @@ model1_rec <- recipe(non_return_rate ~ ., train_data) |>
   update_role(State_name, County_name, Low_Response_Score,
               new_role = "id") |>
   step_rm(has_role("id"),
-          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
           Aggr_House_Value_ACS_13_17, 
           avg_Agg_HH_INC_ACS_13_17,
           avg_Agg_House_Value_ACS_13_17, 
           Aggregate_HH_INC_ACS_13_17,
           Self_Response_Rate_ACS_13_17) |> # remove the problematic vars (chr) 
-  step_log(non_return_rate, offset = 1e-6) |>
   step_log(Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17, offset = 1) |>
   step_log(Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17, offset = 1) |>
   step_log(pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17,
            pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17,
            pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010,
            pct_No_Plumb_ACS_13_17, offset = 1e-6) |>
+  step_rm(all_of(vars_to_drop)) |> # removing highly correlated vars
   step_impute_median(all_numeric_predictors()) |>
   step_normalize(all_numeric_predictors()) 
+
+prep(model1_rec) |> juice() |> names()
 
 model0_mod <- linear_reg() |>
   set_mode(mode = "regression") |>
@@ -315,6 +334,8 @@ model0_resamples |>
 model0_final <- model0_wf |>
   last_fit(split) |>
   collect_metrics()
+
+
 
 ```
 
