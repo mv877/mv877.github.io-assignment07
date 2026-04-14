@@ -83,7 +83,30 @@ train_data |>
   arrange(pct_obs)
 ```
 
+### Transformations
+```{r}
+train_data |>
+  mutate(
+    raw_non   = non_return_rate,
+    log_non = log(non_return_rate + 0.001),
+    logit_non = log(non_return_rate/ (1 - non_return_rate + 0.001))) |>
+  pivot_longer(c(raw_non, log_non, logit_non)) |>
+  ggplot(aes(x = value)) +
+    geom_histogram() +
+    facet_wrap(~name, scales = "free") +
+    labs(title = "Non Return Rate Transformations") +
+    theme_minimal()
 
+```
+Will explore log transformation of non_return_rate. There are also other variables, in particular the income, home value, and population variables which could benefit from a log. 
+
+These are
+Population: Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17, Pop_under_5_CEN_2010, Pop_18_24_CEN_2010
+Value: Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17
+Otherss: pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17,
+pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17,
+pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010,
+pct_No_Plumb_ACS_13_17
 ### Correlations
 Target Correlation: 
 Typically you better features (non-target variables) that are highly correlated with target variables as they provide more predictive power.
@@ -92,14 +115,15 @@ numeric_vars <- train_data |>
   select(where(is.numeric), -non_return_rate)
 
 # find correlations
-correlations <- cor(numeric_vars, train_data$non_return_rate, use = "complete.obs") |>
+correlations <- cor(numeric_vars, train_data$non_return_rate, use = "complete.obs") 
   
 # Convert to dataframe and sort
-non_cor <- data.frame(
+non_cor <- data_frame(
   correlation = (correlations)) |>
   arrange(desc(abs(correlation)))
 
 non_cor
+
 ```
 
 Feature Correlation:
@@ -108,7 +132,7 @@ One potential issue can be when features (non-target variables) are highly corre
 corr_mat <- cor(numeric_vars, use = "pairwise.complete.obs")
 
 # convert to long form
-corr_df <- as.data.frame(as.table(corr_mat))
+corr_data <- as.data.frame(as.table(corr_mat))
 
 # remove self-correlations and duplicates
 corr_df <- corr_df |>
@@ -117,23 +141,22 @@ corr_df <- corr_df |>
   arrange(desc(abs_corr))
 
 # top redundant pairs
-head(corr_df, 20)
+head(corr_df, 100)
 ```
 
+Way too many correlated features to even begin to count. I will approach this issue by creating clusters and picking representative variables by cluster. 
+
+
+
+
+
+PCA can help us look for clustering of features that introduce redundancy into prediction. Basically it'll reduce redundant variables into one component. All i have to add is: 
+
+step_normalize(all_numeric_predictors()) |>
+step_pca(all_numeric_predictors(), num_comp = tune())
 
 ### Potentially Highly Correlated Relationships
 
-```{r}
-train_data |>
-  ggplot(aes(x = non_return_rate, y = Low_Response_Score)) +
-  geom_point(alpha = 0.25) +
-  theme_minimal()
-
-train_data |>
-  ggplot(aes(x = non_return_rate, y = Renter_Occp_HU_ACS_13_17)) +
-  geom_point(alpha = 0.25) +
-  theme_minimal()
-```
 ## Set up cross-validation
 
 ```{r}
@@ -154,7 +177,6 @@ registerDoParallel(cl)
 ## Model 1: Parametric
 
 ### Plain Vanilla Linear Regression
-
 ```{r}
 set.seed(20260412)
 
@@ -169,8 +191,7 @@ model1_rec <- recipe(non_return_rate ~ ., train_data) |>
           avg_Agg_House_Value_ACS_13_17, 
           Aggregate_HH_INC_ACS_13_17,
           Self_Response_Rate_ACS_13_17) |> # remove the problematic vars (chr) 
-  step_impute_median(all_numeric_predictors()) |>
-  step_normalize(all_numeric_predictors())
+  step_impute_median(all_numeric_predictors()) 
 
 model0_mod <- linear_reg() |>
   set_mode(mode = "regression") |>
@@ -209,6 +230,94 @@ top_vars <- imp_tbl$Variable[1:20]
 top_vars
 
 top_vars_clean <- intersect(top_vars, names(train_data))
+```
+```
+
+### With transformations
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score,
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          Self_Response_Rate_ACS_13_17) |> # remove the problematic vars (chr) 
+  step_log(non_return_rate, offset = 1e-6) |>
+  step_log(Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17,
+           Pop_under_5_CEN_2010, Pop_18_24_CEN_2010, offset = 1) |>
+  step_log(Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17, offset = 1) |>
+  step_log(pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17,
+           pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17,
+           pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010,
+           pct_No_Plumb_ACS_13_17, offset = 1e-6) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors()) |> 
+  step_normalize(all_numeric_predictors())
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+model0_resamples <- model0_wf |>
+  fit_resamples(resamples = folds)
+
+model0_resamples |>
+  collect_metrics()
+
+```
+
+### Linear Regression with PCA, given the large number of vars. 
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score,
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          Self_Response_Rate_ACS_13_17) |> # remove the problematic vars (chr) 
+  step_impute_median(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = tune())
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+# adding in pca grid 
+pca_grid <- grid_regular(
+  num_comp(range = c(50, 150)),
+  levels = 10)
+
+model0_resamples <- tune_grid(
+  model0_wf,
+  resamples = folds,
+  grid = pca_grid)
+
+model0_resamples |>
+  collect_metrics()
+
+
+
 ```
 
 ### Elastic Net
@@ -297,7 +406,7 @@ model3_wf <- workflow() |>
 model3_grid <- grid_space_filling(
   mtry(range = c(5, 50)),
   min_n(range = c(5, 40)),
-  size = 20)
+  size = 12)
 
 # Resamples
 model3_resamples <- tune_grid(
@@ -319,13 +428,13 @@ train_data1 <- train_data |>
   select(non_return_rate, all_of(top_vars_clean)) 
 
 # Recipe
-model3_rec <- recipe(non_return_rate ~ ., data = train_data1) |>
+model4_rec <- recipe(non_return_rate ~ ., data = train_data1) |>
   step_impute_median(all_numeric_predictors()) 
 
-prep(model3_rec) |> juice() |> names()
+prep(model4_rec) |> juice() |> names()
 
 # Model
-model3_mod <- rand_forest(min_n = tune(),
+model4_mod <- rand_forest(min_n = tune(),
                           mtry = tune(),
                           trees = 100) |>
   set_mode(mode = "regression") |>
@@ -334,25 +443,25 @@ model3_mod <- rand_forest(min_n = tune(),
              num.threads = parallel::detectCores() - 1) # parallelization
 
 # Workflow
-model3_wf <- workflow() |>
-  add_recipe(model3_rec) |>
-  add_model(model3_mod)
+model4_wf <- workflow() |>
+  add_recipe(model4_rec) |>
+  add_model(model4_mod)
 
 # Tuning grid 
-model3_grid <- grid_space_filling(
+model4_grid <- grid_space_filling(
   mtry(range = c(5, 50)),
   min_n(range = c(5, 40)),
   size = 20)
 
 # Resamples
-model3_resamples <- tune_grid(
-  model3_wf,
+model4_resamples <- tune_grid(
+  model4_wf,
   resamples = folds,
-  grid = model3_grid,
+  grid = model4_grid,
   control = control_grid(parallel_over = "everything")
 )
 
 # Collect metrics
-collect_metrics(model3_resamples)
+collect_metrics(model4_resamples)
 
 ```
