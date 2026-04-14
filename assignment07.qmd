@@ -21,6 +21,7 @@ library(janitor)
 library(corrplot)
 library(tictoc)
 library(vip)
+library(e1071)
 
 data <- read.csv(here("data/assignment_modeling.csv"))
 ```
@@ -62,11 +63,6 @@ tibble(variable = names(train_data),
 # Basic Distribution of non_return_rate 
 summary(train_data$non_return_rate)
 
-
-```{r}
-# Basic Distribution of non_return_rate
-summary(train_data$non_return_rate)
-
 # Non Missing of non_return_rate
 skim(train_data$non_return_rate)
 
@@ -74,13 +70,15 @@ skim(train_data$non_return_rate)
 train_data |>
   ggplot(aes(x = non_return_rate)) +
   geom_histogram() +
-  theme_minimal()
-
+  theme_minimal() +
   labs(title = "Distribution of Non Return Rate") +
   theme_minimal()
 
+# Examine the skewness of the outcome variable
 train_data |> 
   skewness(non_return_rate)
+# Note to Miguel: the skewness command is giving me an error
+
 # State Frequency
 train_data |>
   group_by(State_name) |>
@@ -131,18 +129,15 @@ train_data |>
 ```
 
 ```{r}
-corrplot(train_data)
+train_data |>
+  select(where(is.numeric)) |>
+  corrplot()
 ```
 
 \*Miguel: I got an error with the corrplot function
 
-## Set up cross-validation and parallelization
-            count = n(),
-            pct_obs = count / nrow(train_data) * 100) |>
-  arrange(pct_obs)
-```
-
 ### Transformations
+
 ```{r}
 train_data |>
   mutate(
@@ -155,22 +150,16 @@ train_data |>
     facet_wrap(~name, scales = "free") +
     labs(title = "Non Return Rate Transformations") +
     theme_minimal()
-
 ```
-Will explore log transformation of non_return_rate. There are also other variables, in particular the income, home value, and population variables which could benefit from a log. 
 
-These are
-Population: Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17, Pop_under_5_CEN_2010, Pop_18_24_CEN_2010
-Value: Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17
-Otherss: pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17,
-pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17,
-pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010,
-pct_No_Plumb_ACS_13_17
+Will explore log transformation of non_return_rate. There are also other variables, in particular the income, home value, and population variables which could benefit from a log.
 
+These are Population: Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17, Pop_under_5_CEN_2010, Pop_18_24_CEN_2010 Value: Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17 Otherss: pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17, pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17, pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010, pct_No_Plumb_ACS_13_17
 
 ### Correlations
-Target Correlation: 
-Typically you better features (non-target variables) that are highly correlated with target variables as they provide more predictive power.
+
+Target Correlation: Typically you better features (non-target variables) that are highly correlated with target variables as they provide more predictive power.
+
 ```{r}
 numeric_vars <- train_data |>
   select(where(is.numeric), -non_return_rate)
@@ -187,10 +176,11 @@ non_cor <- data_frame(
 non_cor
 
 ```
-One potential issue is a lot of these variables measure the same thing just in different survey (pct_NH_White_alone_CEN_2010, pct_NH_White_alone_ACS_13_17)	
 
-Feature Correlation:
-One potential issue can be when features (non-target variables) are highly correlated with one another. As one example percentage of families that speak tagalog and spanish may both contribute similar information to our model, and inclusion of both can lead to overfitting and make our estimates less stable. This issue doesn't matter as much for regularized models but does for regular regression. 
+One potential issue is a lot of these variables measure the same thing just in different survey (pct_NH_White_alone_CEN_2010, pct_NH_White_alone_ACS_13_17)
+
+Feature Correlation: One potential issue can be when features (non-target variables) are highly correlated with one another. As one example percentage of families that speak tagalog and spanish may both contribute similar information to our model, and inclusion of both can lead to overfitting and make our estimates less stable. This issue doesn't matter as much for regularized models but does for regular regression.
+
 ```{r}
 corr_mat <- cor(numeric_vars, use = "pairwise.complete.obs")
 
@@ -206,8 +196,9 @@ plot(hc, labels = FALSE, main = "Correlation Clusters")
 clusters <- cutree(hc, h = 0.15)   # 1 - .85
 table(clusters)
 ```
-Way too many correlated features to even begin to count. I will approach this issue by creating clusters and picking representative variables by cluster. 
-Cluster 7 seems like its the biggest issue but there are a few blocks of collinearity
+
+Way too many correlated features to even begin to count. I will approach this issue by creating clusters and picking representative variables by cluster. Cluster 7 seems like its the biggest issue but there are a few blocks of collinearity
+
 ```{r}
 # Now ill attach cluster numbers to each variable
 cluster_df <- data.frame(
@@ -225,14 +216,9 @@ vars_to_drop
 
 ```
 
+PCA can help us look for clustering of features that introduce redundancy into prediction. Basically it'll reduce redundant variables into one component. All i have to add is:
 
-
-PCA can help us look for clustering of features that introduce redundancy into prediction. Basically it'll reduce redundant variables into one component. All i have to add is: 
-
-step_normalize(all_numeric_predictors()) |>
-step_pca(all_numeric_predictors(), num_comp = tune())
-
-### Potentially Highly Correlated Relationships
+step_normalize(all_numeric_predictors()) \|\> step_pca(all_numeric_predictors(), num_comp = tune())
 
 ## Set up cross-validation
 
@@ -247,104 +233,15 @@ library(doParallel)
 cl <- makePSOCKcluster(parallel::detectCores() - 1)
 registerDoParallel(cl)
 ```
-library(doParallel)
-cl <- makeCluster(parallel::detectCores() - 1)
-registerDoParallel(cl)
-```
 
 \*Note to Miguel: when I tried to run the random forest model with 5 fold cross validation without parallelization, it took a very long time to run - I ended up quitting and restarting to see if we can make changes to either the number of folds, adding parallelization, or making some other change to save computation time.
 
 # Predictive Modeling
 
-## Model 1: Linear regression (parametric)
-
-```{r}
-set.seed(20260412)
-
-# Recipe
-model1_rec <- recipe(non_return_rate ~ ., train_data) |>
-  update_role(State_name, County_name, Low_Response_Score, Aggregate_HH_INC_ACS_13_17, 
-              new_role = "id") |>
-  step_rm(has_role("id"),
-          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
-          Aggr_House_Value_ACS_13_17, 
-          avg_Agg_HH_INC_ACS_13_17,
-          avg_Agg_House_Value_ACS_13_17,
-          Self_Response_Rate_ACS_13_17) |> # remove the problematic fact 
-  step_impute_median(all_numeric_predictors()) 
-
-# Mode
-model0_mod <- linear_reg() |>
-  set_mode(mode = "regression") |>
-  set_engine(engine = "lm")
-
-model0_wf <- workflow() |>
-  add_recipe(model1_rec) |>
-  add_model(model0_mod)
-
-model0_resamples <- model0_wf |>
-  fit_resamples(resamples = folds)
-
-model0_resamples |>
-  collect_metrics()
-```
-
-\*Miguel - why did you remove Aggregate_HH_INC_ACS_13_17
-
-```{r}
-# Variable importance
-model0_final <- model0_wf |>
-  last_fit(split) 
-
-model0_final |>
-  extract_fit_parsnip() |>
-  vip(num_features = 20) 
-```
-
-### Elastic Net
-
-```{r}
-set.seed(20260412)
-
-# Recipe
-model1_rec <- recipe(non_return_rate ~ ., train_data) |>
-  update_role(State_name, County_name, Low_Response_Score, Aggregate_HH_INC_ACS_13_17, 
-              new_role = "id") |>
-  step_rm(has_role("id"),
-          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
-          Aggr_House_Value_ACS_13_17, 
-          avg_Agg_HH_INC_ACS_13_17,
-          avg_Agg_House_Value_ACS_13_17) |> # remove the problematic fact 
-  step_impute_median(all_numeric_predictors()) 
-
-
-# Mode
-model1_mode <- linear_reg(penalty = tune(), mixture = tune()) |> # works best for many variables 
-  set_mode(mode = "regression") |>
-  set_engine(engine = "glmnet") 
-
-# Workflow
-model1_wf <- workflow() |>
-  add_recipe(model1_rec) |>
-  add_model(model1_mode)
-
-# resamples
-model1_grid <- grid_regular(
-  penalty(), 
-  mixture(),
-  levels = 20
-)
-
-model1_tuning <- tune_grid(
-  model1_wf,
-  resamples = folds,
-  grid = model1_grid
-)
-
-show_best(model1_tuning)
-```
+## Model 1: Parametric
 
 ### Plain Vanilla Linear Regression
+
 ```{r}
 set.seed(20260412)
 
@@ -377,8 +274,9 @@ model0_resamples <- model0_wf |>
 model0_resamples |>
   collect_metrics()
 
-
 ```
+
+\*Miguel - why did you remove Aggregate_HH_INC_ACS_13_17
 
 ```{r}
 # Variable importance
@@ -407,6 +305,7 @@ top_vars_clean <- intersect(top_vars, names(train_data))
 ```
 
 ### Trying to remove redundant features
+
 ```{r}
 set.seed(20260412)
 
@@ -439,9 +338,11 @@ model0_resamples <- model0_wf |>
 model0_resamples |>
   collect_metrics()
 ```
+
 Didn't really do anything lol
 
 ### With transformations
+
 ```{r}
 set.seed(20260412)
 
@@ -489,7 +390,8 @@ model0_final <- model0_wf |>
 
 ```
 
-### Linear Regression with PCA, given the large number of vars. 
+### Linear Regression with PCA, given the large number of vars.
+
 ```{r}
 set.seed(20260412)
 
@@ -528,8 +430,6 @@ model0_resamples <- tune_grid(
 
 model0_resamples |>
   collect_metrics()
-
-
 
 ```
 
@@ -592,7 +492,8 @@ In the recipe, several variables are removed, as well as variables with low vari
 threefold <- vfold_cv(train_data, v = 3)
 ```
 
-For our third model, we have selected random forest, an ensembling approach. We tune the hyperparameters *min_n*, the minimum number of data points required in a node before further splitting, and *mtry*, the number of predcitors considered at each split. We use 200 trees.
+### RF Model 1
+
 ```{r}
 set.seed(20260412)
 tic()
@@ -609,17 +510,7 @@ model3_rec <- recipe(non_return_rate ~ ., data = train_data) |>
           Self_Response_Rate_ACS_13_17) |> 
   step_impute_median(all_numeric_predictors()) |>
   step_nzv(all_predictors()) |> # remove predictors with low variance
-  step_corr(allpredictors(), threshold = 0.9) # remove predictors 90% correlated with each other
-model3_rec <- recipe(non_return_rate ~ ., data = train_data1) |>
-  update_role(State_name, County_name, Low_Response_Score, new_role = "id") |>
-  step_rm(has_role("id"),
-          pct_TEA_Update_Leave_CEN_2010,
-          Aggr_House_Value_ACS_13_17,
-          avg_Agg_HH_INC_ACS_13_17,
-          avg_Agg_House_Value_ACS_13_17,
-          Aggregate_HH_INC_ACS_13_17,
-          Self_Response_Rate_ACS_13_17) |>
-  step_impute_median(all_numeric_predictors()) |>
+  step_corr(allpredictors(), threshold = 0.9) |> # remove predictors 90% correlated with each other
   step_select(top_vars)
 
 # Model
@@ -653,9 +544,12 @@ model3_resamples <- tune_grid(
 
 # Collect metrics
 collect_metrics(model3_resamples)
+
+toc()
 ```
 
-Model 2 (with only the best fits from earlier )
+### RF Model 2 (with only the best fits from earlier )
+
 ```{r}
 set.seed(20260412)
 tic()
