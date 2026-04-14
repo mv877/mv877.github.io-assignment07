@@ -107,6 +107,8 @@ Otherss: pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17,
 pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17,
 pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010,
 pct_No_Plumb_ACS_13_17
+
+
 ### Correlations
 Target Correlation: 
 Typically you better features (non-target variables) that are highly correlated with target variables as they provide more predictive power.
@@ -119,33 +121,66 @@ correlations <- cor(numeric_vars, train_data$non_return_rate, use = "complete.ob
   
 # Convert to dataframe and sort
 non_cor <- data_frame(
+  variable = rownames(correlations),
   correlation = (correlations)) |>
   arrange(desc(abs(correlation)))
 
 non_cor
 
 ```
+One potential issue is a lot of these variables measure the same thing just in different survey (pct_NH_White_alone_CEN_2010, pct_NH_White_alone_ACS_13_17)	
 
 Feature Correlation:
 One potential issue can be when features (non-target variables) are highly correlated with one another. As one example percentage of families that speak tagalog and spanish may both contribute similar information to our model, and inclusion of both can lead to overfitting and make our estimates less stable. This issue doesn't matter as much for regularized models but does for regular regression. 
 ```{r}
 corr_mat <- cor(numeric_vars, use = "pairwise.complete.obs")
 
-# convert to long form
-corr_data <- as.data.frame(as.table(corr_mat))
+# distance based
+dist_mat <- as.dist(1 - abs(corr_mat))
 
-# remove self-correlations and duplicates
-corr_df <- corr_df |>
-  filter(Var1 != Var2) |>
-  mutate(abs_corr = abs(Freq)) |>
-  arrange(desc(abs_corr))
+# hierarchical clustering
+hc <- hclust(dist_mat, method = "average")
 
-# top redundant pairs
-head(corr_df, 100)
+plot(hc, labels = FALSE, main = "Correlation Clusters")
+
+# Id'ing cluster
+clusters <- cutree(hc, h = 0.15)   # 1 - .85
+table(clusters)
 ```
+Cluster 7 seems like its the biggest issue but there are a few blocks of collinearity
+```{r}
+# Now ill attach cluster numbers to each variable
+cluster_df <- data.frame(
+  variable = names(numeric_vars),
+  cluster  = clusters
+)
 
+representatives <- cluster_df |>
+  group_by(cluster) |>
+  slice(1) |> 
+  pull(variable)
+
+vars_to_drop <- setdiff(cluster_df$variable, representatives)
+
+vars_to_drop
+
+```
 Way too many correlated features to even begin to count. I will approach this issue by creating clusters and picking representative variables by cluster. 
+```{r}
+library(igraph)
 
+# adjacency matrix for |r| > .85
+adj <- abs(corr_mat) > 0.85
+diag(adj) <- FALSE
+
+g <- graph_from_adjacency_matrix(adj, mode = "undirected")
+
+components <- components(g)
+sizes <- components$csize
+
+sizes
+
+```
 
 
 
@@ -185,13 +220,14 @@ model1_rec <- recipe(non_return_rate ~ ., train_data) |>
   update_role(State_name, County_name, Low_Response_Score,
               new_role = "id") |>
   step_rm(has_role("id"),
-          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
           Aggr_House_Value_ACS_13_17, 
           avg_Agg_HH_INC_ACS_13_17,
           avg_Agg_House_Value_ACS_13_17, 
           Aggregate_HH_INC_ACS_13_17,
-          Self_Response_Rate_ACS_13_17) |> # remove the problematic vars (chr) 
-  step_impute_median(all_numeric_predictors()) 
+          Self_Response_Rate_ACS_13_17,
+          pct_TEA_Update_Leave_CEN_2010) |> # removing census duplicated vars
+  step_rm(all_of(vars_to_drop)) |>
+  step_impute_median(all_numeric_predictors())
 
 model0_mod <- linear_reg() |>
   set_mode(mode = "regression") |>
@@ -207,6 +243,10 @@ model0_resamples <- model0_wf |>
 model0_resamples |>
   collect_metrics()
 
+
+```
+
+```{r}
 # Variable importance
 model0_final <- model0_wf |>
   last_fit(split) 
@@ -231,7 +271,7 @@ top_vars
 
 top_vars_clean <- intersect(top_vars, names(train_data))
 ```
-```
+
 
 ### With transformations
 ```{r}
@@ -249,16 +289,14 @@ model1_rec <- recipe(non_return_rate ~ ., train_data) |>
           Aggregate_HH_INC_ACS_13_17,
           Self_Response_Rate_ACS_13_17) |> # remove the problematic vars (chr) 
   step_log(non_return_rate, offset = 1e-6) |>
-  step_log(Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17,
-           Pop_under_5_CEN_2010, Pop_18_24_CEN_2010, offset = 1) |>
+  step_log(Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17, offset = 1) |>
   step_log(Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17, offset = 1) |>
   step_log(pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17,
            pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17,
            pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010,
            pct_No_Plumb_ACS_13_17, offset = 1e-6) |>
   step_impute_median(all_numeric_predictors()) |>
-  step_zv(all_numeric_predictors()) |> 
-  step_normalize(all_numeric_predictors())
+  step_normalize(all_numeric_predictors()) 
 
 model0_mod <- linear_reg() |>
   set_mode(mode = "regression") |>
@@ -272,6 +310,10 @@ model0_resamples <- model0_wf |>
   fit_resamples(resamples = folds)
 
 model0_resamples |>
+  collect_metrics()
+
+model0_final <- model0_wf |>
+  last_fit(split) |>
   collect_metrics()
 
 ```
@@ -430,8 +472,6 @@ train_data1 <- train_data |>
 # Recipe
 model4_rec <- recipe(non_return_rate ~ ., data = train_data1) |>
   step_impute_median(all_numeric_predictors()) 
-
-prep(model4_rec) |> juice() |> names()
 
 # Model
 model4_mod <- rand_forest(min_n = tune(),
