@@ -134,7 +134,7 @@ train_data |>
   corrplot()
 ```
 
-\*Miguel: I got an error with the corrplot function
+\*Note to Miguel: I got an error with the corrplot function
 
 ### Transformations
 
@@ -479,7 +479,81 @@ model1_fit |>
   vip(num_features = 20) 
 ```
 
-## Model 2: Non-parametric
+## Model 2: Regression tree (Non-parametric)
+
+For our second model, we have selected a regression tree, a non-parametric approach. We tune the following three regression tree hyperparameters:
+
+-   Cost complexity - balances accuracy with tree size
+
+-   Tree depth - the length from the root node to the farthest leaf
+
+-   min_n - the minimum number of data points a node must contain before further splitting
+
+```{r}
+set.seed(20260414)
+tic()
+# Recipe
+model2_rec <- recipe(non_return_rate ~ ., data = train_data) |>
+  add_role(GIDTR, State_name, County_name, new_role = "id") |>
+  step_rm(all_of(vars_to_drop)) |> # removing highly correlated vars
+  step_rm(has_role("id"),
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, # remove the problematic fact 
+          Low_Response_Score,
+          Self_Response_Rate_ACS_13_17) |> 
+  step_impute_median(all_numeric_predictors()) |>
+  step_nzv(all_predictors()) |> # remove predictors with low variance
+  step_corr(all_numeric_predictors(), threshold = 0.9) # remove predictors 90% correlated with each other
+
+# Miguel - I think we should touch base about this recipe and the order of steps to make sure it makes sense 
+
+# Model
+model2_mod <- decision_tree(
+    cost_complexity = tune(),
+    tree_depth = tune(),
+    min_n = tune()
+  ) |>
+  set_engine(engine = "rpart") |>
+  set_mode(mode = "regression")
+
+# Tuning grid
+model2_grid <- grid_space_filling(
+  cost_complexity(range = c(-5, -1)), 
+  tree_depth(range = c(3, 15)), 
+  min_n(range = c(2, 50)),
+  size = 20
+)
+
+# Workflow
+model2_wf <-
+  workflow() |>
+  add_recipe(recipe = model2_rec) |>
+  add_model(spec = model2_mod)
+
+# Resamples
+model2_resamples <- model2_wf |>
+  tune_grid(resamples = folds,
+            grid = model2_grid,
+            metrics = metric_set(rmse),
+            control = control_grid(parallel_over = "everything"))
+
+# Collect metrics
+collect_metrics(model2_resamples)
+toc()
+```
+
+```{r}
+model2_resamples |>
+  show_best()
+
+# Visualize the results
+autoplot(model2_resamples)
+```
+
+In the top results, the tree depth varies widely, the cost complexity is very small, and the min_n is moderately large. These results suggest that the tree depth doesn't matter very much, but smaller cost complexity and splitting on moderate/large nodes are best.
+
+\*Note to Miguel: I deleted the version of regression tree with a very long run time (12666.4 sec). In this now deleted version, I tried increasing the size of the grid to 100 to try more options, a different range for cost complexity, and a larger range of min_n. I also tried changing the order of my recipe steps to remove variables with low variance before imputation, and the threshold of step_corr to 0.75 instead of 0.9 since we already removed variables with high correlation. It had very little effect on RMSE. I welcome any changes to feature selection/engineering you want to add to improve Model 2, or just leave it as is.
 
 ## Model 3: Random forest (ensembling)
 
@@ -557,7 +631,7 @@ train_data1 <- train_data |>
   select(non_return_rate, all_of(top_vars_clean)) 
 
 # Recipe
-model4_rec <- recipe(non_return_rate ~ ., data = train_data1) |>
+model4_rec <- recipe(non_return_rate ~ ., data = train_data1) |> # Miguel, what is traindata1?
   step_impute_median(all_numeric_predictors()) 
 
 # Model
