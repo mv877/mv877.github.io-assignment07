@@ -21,7 +21,6 @@ library(janitor)
 library(corrplot)
 library(tictoc)
 library(vip)
-library(e1071)
 
 data <- read.csv(here("data/assignment_modeling.csv"))
 ```
@@ -35,6 +34,13 @@ split <- initial_split(data, prop = 0.8)
 
 # Obtain the training data
 train_data <- training(split)
+```
+
+## Set up cross-validation
+
+```{r}
+# 5 fold cross-validation
+folds <- vfold_cv(train_data, v = 5)
 ```
 
 ## EDA on the training data
@@ -220,19 +226,7 @@ PCA can help us look for clustering of features that introduce redundancy into p
 
 step_normalize(all_numeric_predictors()) \|\> step_pca(all_numeric_predictors(), num_comp = tune())
 
-## Set up cross-validation
 
-```{r}
-# 5 fold cross-validation
-folds <- vfold_cv(train_data, v = 5)
-```
-
-```{r}
-# Set up parallelization
-library(doParallel)
-cl <- makePSOCKcluster(parallel::detectCores() - 1)
-registerDoParallel(cl)
-```
 
 \*Note to Miguel: when I tried to run the random forest model with 5 fold cross validation without parallelization, it took a very long time to run - I ended up quitting and restarting to see if we can make changes to either the number of folds, adding parallelization, or making some other change to save computation time.
 
@@ -275,8 +269,6 @@ model0_resamples |>
   collect_metrics()
 
 ```
-
-\*Miguel - why did you remove Aggregate_HH_INC_ACS_13_17
 
 ```{r}
 # Variable importance
@@ -386,7 +378,7 @@ model0_final <- model0_wf |>
   last_fit(split) |>
   collect_metrics()
 
-
+model0_final 
 
 ```
 
@@ -411,7 +403,6 @@ model1_rec <- recipe(non_return_rate ~ ., train_data) |>
   step_pca(all_numeric_predictors(), num_comp = tune())
 
 model0_mod <- linear_reg() |>
-  set_mode(mode = "regression") |>
   set_engine(engine = "lm")
 
 model0_wf <- workflow() |>
@@ -420,8 +411,8 @@ model0_wf <- workflow() |>
 
 # adding in pca grid 
 pca_grid <- grid_regular(
-  num_comp(range = c(50, 150)),
-  levels = 10)
+  num_comp(range = c(100, 180)), # Start smaller to test if it works
+  levels = 5)
 
 model0_resamples <- tune_grid(
   model0_wf,
@@ -431,12 +422,30 @@ model0_resamples <- tune_grid(
 model0_resamples |>
   collect_metrics()
 
+best_pca <- select_best(model0_resamples, metric = "rmse")
+
+autoplot(model0_resamples)
+
+
 ```
+Ultimately both the PCA analysis and correlation reduction reveal similar level of increased model performance which is nice!
 
 ### Elastic Net
 
 ```{r}
 set.seed(20260412)
+
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  update_role(State_name, County_name, Low_Response_Score,
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          Self_Response_Rate_ACS_13_17) |> # removing census duplicated vars
+  step_rm(all_of(vars_to_drop)) |> # removing highly correlated vars
+  step_impute_median(all_numeric_predictors())
 
 # Mode
 model1_mode <- linear_reg(penalty = tune(), mixture = tune()) |> # works best for many variables 
@@ -494,7 +503,7 @@ set.seed(20260414)
 tic()
 # Recipe
 model2_rec <- recipe(non_return_rate ~ ., data = train_data) |>
-  add_role(GIDTR, State_name, County_name, new_role = "id") |>
+  update_role(GIDTR, State_name, County_name, new_role = "id") |>
   step_rm(all_of(vars_to_drop)) |> # removing highly correlated vars
   step_rm(has_role("id"),
           Aggr_House_Value_ACS_13_17, 
@@ -502,9 +511,7 @@ model2_rec <- recipe(non_return_rate ~ ., data = train_data) |>
           avg_Agg_House_Value_ACS_13_17, # remove the problematic fact 
           Low_Response_Score,
           Self_Response_Rate_ACS_13_17) |> 
-  step_impute_median(all_numeric_predictors()) |>
-  step_nzv(all_predictors()) |> # remove predictors with low variance
-  step_corr(all_numeric_predictors(), threshold = 0.9) # remove predictors 90% correlated with each other
+  step_impute_median(all_numeric_predictors()) 
 
 # Miguel - I think we should touch base about this recipe and the order of steps to make sure it makes sense 
 
@@ -520,8 +527,8 @@ model2_mod <- decision_tree(
 # Tuning grid
 model2_grid <- grid_space_filling(
   cost_complexity(range = c(-5, -1)), 
-  tree_depth(range = c(3, 15)), 
-  min_n(range = c(2, 50)),
+  tree_depth(range = c(3, 10)), 
+  min_n(range = c(5, 50)),
   size = 20
 )
 
@@ -574,27 +581,24 @@ tic()
 
 # Recipe
 model3_rec <- recipe(non_return_rate ~ ., data = train_data) |>
-  add_role(GIDTR, State_name, County_name, new_role = "id") |>
+  update_role(GIDTR, State_name, County_name, new_role = "id") |>
   step_rm(has_role("id"),
-          pct_TEA_Update_Leave_CEN_2010, # remove the high missingness
           Aggr_House_Value_ACS_13_17, 
           avg_Agg_HH_INC_ACS_13_17,
           avg_Agg_House_Value_ACS_13_17, # remove the problematic fact 
           Low_Response_Score,
           Self_Response_Rate_ACS_13_17) |> 
-  step_impute_median(all_numeric_predictors()) |>
-  step_nzv(all_predictors()) |> # remove predictors with low variance
-  step_corr(allpredictors(), threshold = 0.9) |> # remove predictors 90% correlated with each other
-  step_select(top_vars)
+  step_rm(all_of(vars_to_drop)) |> # removing highly correlated vars
+  step_impute_median(all_numeric_predictors()) 
 
 # Model
 model3_mod <- rand_forest(min_n = tune(), # hyperparameter tuning
                           mtry = tune(),
                           trees = 100) |>
-  set_mode(mode = "regression") |>
   set_engine(engine = "ranger",
              importance = "impurity",
-             num.threads = parallel::detectCores() - 1) # parallelization
+             num.threads = parallel::detectCores() - 1) |> # parallelization
+  set_mode(mode = "regression")
 
 # Workflow
 model3_wf <- workflow() |>
@@ -611,7 +615,7 @@ model3_grid <- grid_space_filling(
 # Resamples
 model3_resamples <- tune_grid(
   model3_wf,
-  resamples = threefold,
+  resamples = folds,
   grid = model3_grid,
   control = control_grid(parallel_over = "everything")
 )
@@ -620,6 +624,14 @@ model3_resamples <- tune_grid(
 collect_metrics(model3_resamples)
 
 toc()
+
+# Best parameters
+best_rf <- select_best(model3_resamples, metric = "rmse")
+
+# Finalize and fit 
+final_rf_wf <- finalize_workflow(model3_wf, best_rf)
+
+final_rf_fit <- fit(final_rf_wf, data = train_data)
 ```
 
 ### RF Model 2 (with only the best fits from earlier )
@@ -627,8 +639,6 @@ toc()
 ```{r}
 set.seed(20260412)
 tic()
-train_data1 <- train_data |>
-  select(non_return_rate, all_of(top_vars_clean)) 
 
 # Recipe
 model4_rec <- recipe(non_return_rate ~ ., data = train_data1) |> # Miguel, what is traindata1?
@@ -668,4 +678,27 @@ collect_metrics(model4_resamples)
 # Plot
 autoplot(model3_resamples)
 toc()
+```
+
+
+## Fitting the best model on the implementation data
+```{r}
+# Load the implementation file
+implementation_data <- read_csv(here("data/assignment_implementation.csv")) |>
+
+implementation_data <- implementation_data |>
+  mutate(GIDTR = as.numeric(GIDTR))
+
+# Predictions
+predictions <- predict(final_rf_fit, new_data = implementation_data)
+
+# 2. creating df for performance
+performance <- implementation_data |>
+  select(GIDTR) |>
+  bind_cols(predictions)
+
+# Creating CSV with just id and predictions
+write_csv(performance, "best_model.csv")
+
+
 ```
