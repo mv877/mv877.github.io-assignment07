@@ -634,54 +634,88 @@ final_rf_wf <- finalize_workflow(model3_wf, best_rf)
 final_rf_fit <- fit(final_rf_wf, data = train_data)
 ```
 
-### RF Model 2 (with only the best fits from earlier )
+### XGB Model
 
 ```{r}
 set.seed(20260412)
 tic()
 
-# Recipe
-model4_rec <- recipe(non_return_rate ~ ., data = train_data1) |> # Miguel, what is traindata1?
+library(xgboost)
+library(doParallel)
+
+# Parallelize across all available cores
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+# Recipe 
+model5_rec <- recipe(non_return_rate ~ ., data = train_data) |>
+  update_role(GIDTR, State_name, County_name, new_role = "id") |>
+  step_rm(has_role("id"),
+          Aggr_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17,
+          Low_Response_Score,
+          Self_Response_Rate_ACS_13_17) |> 
+  step_rm(all_of(vars_to_drop)) |>
   step_impute_median(all_numeric_predictors()) 
 
-# Model
-model4_mod <- rand_forest(min_n = tune(),
-                          mtry = tune(),
-                          trees = 100) |>
-  set_mode(mode = "regression") |>
-  set_engine(engine = "ranger",
-             importance = "impurity",
-             num.threads = parallel::detectCores() - 1) # parallelization
+prep(model5_rec) |> juice() |> names()
 
-# Workflow
-model4_wf <- workflow() |>
-  add_recipe(model4_rec) |>
-  add_model(model4_mod)
+xgb_spec <- boost_tree(
+  trees = 500,
+  stop_iter = 20,
+  tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(), mtry = tune(),
+  learn_rate = tune()) |>
+  set_engine("xgboost", 
+             validation = 0.1,      # holds out 10% to monitor early stopping
+             nthread = 1) |>        # 1 thread per model since we parallelize across folds
+  set_mode("regression")
 
-# Tuning grid 
-model4_grid <- grid_space_filling(
-  mtry(range = c(5, 50)),
-  min_n(range = c(5, 40)),
-  size = 20)
-
-# Resamples
-model4_resamples <- tune_grid(
-  model4_wf,
-  resamples = folds,
-  grid = model4_grid,
-  control = control_grid(parallel_over = "everything")
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(range = c(3, 8)),       
+  min_n(range = c(2, 10)),
+  loss_reduction(range = c(-3, -1)),
+  sample_size = sample_prop(range = c(0.6, 0.9)), 
+  mtry(range = c(5, 20)),           
+  learn_rate(range = c(-3, -1)),    
+  size = 15
 )
 
-# Collect metrics
-collect_metrics(model4_resamples)
+xgb_wf <- workflow() |>
+  add_recipe(model5_rec) |>
+  add_model(xgb_spec)
 
-# Plot
-autoplot(model3_resamples)
+xgb_resamples <- tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(
+    parallel_over = "everything",
+    save_pred = FALSE,         
+    verbose = TRUE      
+  )
+)
+
+collect_metrics(xgb_resamples)
+
+# Best parameters
+best_xgb <- select_best(xgb_resamples, metric = "rmse")
+
+final_xgb_wf <- finalize_workflow(xgb_wf, best_xgb)
+
+# fit on full split
+final_xgb_fit <- last_fit(final_xgb_wf, split = split)
+
+# calculate fit
+collect_metrics(final_xgb_fit)
+
 toc()
+
 ```
 
-
-## Fitting the best model on the implementation data
+## Fitting the random forest model on the implementation data
 ```{r}
 # Load the implementation file
 implementation_data <- read_csv(here("data/assignment_implementation.csv")) |>
@@ -692,13 +726,33 @@ implementation_data <- implementation_data |>
 # Predictions
 predictions <- predict(final_rf_fit, new_data = implementation_data)
 
-# 2. creating df for performance
+# creating df for performance
 performance <- implementation_data |>
   select(GIDTR) |>
   bind_cols(predictions)
 
 # Creating CSV with just id and predictions
 write_csv(performance, "best_model.csv")
+```
 
 
+## Fitting the xgb model on the implementation data
+```{r}
+# Load the implementation file
+implementation_data <- read_csv(here("data/assignment_implementation.csv")) |>
+  mutate(GIDTR = as.numeric(GIDTR))
+
+# extract workflow
+final_xgb_model <- extract_workflow(final_xgb_fit)
+
+# Predictions
+predictions <- predict(final_xgb_model, new_data = implementation_data)
+
+# data frame with performance
+performance <- implementation_data |>
+  select(GIDTR) |>
+  bind_cols(predictions)
+
+# Creating CSV with just id and predictions
+write_csv(performance, "best_model.csv")
 ```
