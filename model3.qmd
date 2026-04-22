@@ -1,0 +1,249 @@
+---
+title: "Model 3"
+author: "Sarah Krause and Miguel Villa"
+format: html
+editor: visual
+embed-resources: true
+execute:
+  cache: true
+---
+## Repeat of Earlier Steps
+```{r message=FALSE, warning=FALSE}
+#| code-fold: true
+
+options(scipen = 999)
+
+library(tidyverse)
+library(here)
+library(tidymodels)
+library(skimr)
+library(janitor)
+library(corrplot)
+library(tictoc)
+library(vip)
+
+data <- read.csv(here("data/assignment_modeling.csv"))
+
+## Split the data
+
+set.seed(20260412)
+# Place 80% of the data in the training data
+split <- initial_split(data, prop = 0.8)
+
+# Obtain the training data
+train_data <- training(split)
+
+## Set up cross-validation
+
+# 5 fold cross-validation
+folds <- vfold_cv(train_data, v = 5)
+
+# specifying only numeric variables 
+numeric_vars <- train_data |>
+  select(where(is.numeric), -non_return_rate)
+
+# find correlations
+correlations <- cor(numeric_vars, train_data$non_return_rate, use = "complete.obs") 
+  
+# Convert to dataframe and sort
+non_cor <- tibble(
+  variable = rownames(correlations),
+  correlation = (correlations)) |>
+  arrange(desc(abs(correlation)))
+corr_mat <- cor(numeric_vars, use = "pairwise.complete.obs")
+
+# distance based
+dist_mat <- as.dist(1 - abs(corr_mat))
+
+# hierarchical clustering
+hc <- hclust(dist_mat, method = "average")
+
+# Id'ing cluster
+clusters <- cutree(hc, h = 0.15)   # 1 - .85
+
+cluster_df <- data.frame(
+  variable = names(numeric_vars),
+  cluster  = clusters)
+
+representatives <- cluster_df |>
+  group_by(cluster) |>
+  slice(1) |> 
+  pull(variable)
+
+vars_to_drop <- setdiff(cluster_df$variable, representatives)
+```
+
+
+### Random Forrest Model 1
+
+```{r message=FALSE, warning=FALSE}
+#| freeze: true
+
+set.seed(20260412)
+tic()
+
+# Recipe
+model3_rec <- recipe(non_return_rate ~ ., data = train_data) |>
+  update_role(GIDTR, State_name, County_name, new_role = "id") |>
+  step_rm(has_role("id"),
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, # remove the problematic fact 
+          Low_Response_Score,
+          Self_Response_Rate_ACS_13_17) |> 
+  step_rm(all_of(vars_to_drop)) |> # removing highly correlated vars
+  step_impute_median(all_numeric_predictors()) 
+
+# Model
+model3_mod <- rand_forest(min_n = tune(), # hyperparameter tuning
+                          mtry = tune(),
+                          trees = 100) |>
+  set_engine(engine = "ranger",
+             importance = "impurity",
+             num.threads = parallel::detectCores() - 1) |> # parallelization
+  set_mode(mode = "regression")
+
+# Workflow
+model3_wf <- workflow() |>
+  add_recipe(model3_rec) |>
+  add_model(model3_mod)
+
+# Tuning grid
+model3_grid <- grid_space_filling(
+  mtry(range = c(5, 50)),
+  min_n(range = c(5, 40)),
+  size = 20
+)
+
+# Resamples
+model3_resamples <- tune_grid(
+  model3_wf,
+  resamples = folds,
+  grid = model3_grid,
+  control = control_grid(parallel_over = "everything")
+)
+
+# Collect metrics
+collect_metrics(model3_resamples)
+
+toc()
+
+# Best parameters
+best_rf <- select_best(model3_resamples, metric = "rmse")
+
+# Finalize and fit 
+final_rf_wf <- finalize_workflow(model3_wf, best_rf)
+
+final_rf_fit <- fit(final_rf_wf, data = train_data)
+
+```
+
+```{r}
+# Calculate fit
+collect_metrics(final_rf_fit)
+```
+
+### XGB Model
+
+```{r message=FALSE, warning=FALSE}
+#| freeze: true
+
+set.seed(20260412)
+tic()
+
+library(xgboost)
+library(doParallel)
+
+# Parallelize across all available cores
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+# Recipe 
+model5_rec <- recipe(non_return_rate ~ ., data = train_data) |>
+  update_role(GIDTR, State_name, County_name, new_role = "id") |>
+  step_rm(has_role("id"),
+          Aggr_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17,
+          Low_Response_Score,
+          Self_Response_Rate_ACS_13_17) |> 
+  step_rm(all_of(vars_to_drop)) |>
+  step_impute_median(all_numeric_predictors()) 
+
+prep(model5_rec) |> juice() |> names()
+
+xgb_spec <- boost_tree(
+  trees = 500,
+  stop_iter = 20,
+  tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(), mtry = tune(),
+  learn_rate = tune()) |>
+  set_engine("xgboost", 
+             validation = 0.1,      # holds out 10% to monitor early stopping
+             nthread = 1) |>        # 1 thread per model since we parallelize across folds
+  set_mode("regression")
+
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(range = c(3, 8)),       
+  min_n(range = c(2, 10)),
+  loss_reduction(range = c(-3, -1)),
+  sample_size = sample_prop(range = c(0.6, 0.9)), 
+  mtry(range = c(5, 20)),           
+  learn_rate(range = c(-3, -1)),    
+  size = 15
+)
+
+xgb_wf <- workflow() |>
+  add_recipe(model5_rec) |>
+  add_model(xgb_spec)
+
+xgb_resamples <- tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(
+    parallel_over = "everything",
+    save_pred = FALSE,         
+    verbose = TRUE      
+  )
+)
+
+collect_metrics(xgb_resamples)
+
+# Best parameters
+best_xgb <- select_best(xgb_resamples, metric = "rmse")
+
+final_xgb_wf <- finalize_workflow(xgb_wf, best_xgb)
+
+# fit on full split
+final_xgb_fit <- last_fit(final_xgb_wf, split = split)
+
+# calculate fit
+collect_metrics(final_xgb_fit)
+
+toc()
+
+```
+
+
+## Fitting the xgb (best) model on the implementation data
+```{r}
+# Load the implementation file
+implementation_data <- read_csv(here("data/assignment_implementation.csv")) |>
+  mutate(GIDTR = as.numeric(GIDTR))
+
+# extract workflow
+final_xgb_model <- extract_workflow(final_xgb_fit)
+
+# Predictions
+predictions <- predict(final_xgb_model, new_data = implementation_data)
+
+# data frame with performance
+performance <- implementation_data |>
+  select(GIDTR) |>
+  bind_cols(predictions)
+
+# Creating CSV with just id and predictions
+write_csv(performance, "best_model.csv")
+```
