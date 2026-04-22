@@ -47,7 +47,8 @@ train_data <- training(split)
 names(train_data)
 
 # Glimpse the training data
-glimpse(train_data) # we will have to remove this characters Aggregate_HH_INC_ACS_13_17, avg_Agg_HH_INC_ACS_13_17, Aggr_House_Value_ACS_13_17
+glimpse(train_data) 
+# We will have to remove the character variables: Aggregate_HH_INC_ACS_13_17, avg_Agg_HH_INC_ACS_13_17, Aggr_House_Value_ACS_13_17
 
 # Check the structure 
 str(train_data)
@@ -530,17 +531,22 @@ en_final_wf <- finalize_workflow(
   en_best)
 ```
 
-We do see a slight improvement in our RMSE by using elastic net regression. Next, we extract the top 20 most important predictors.
+We do see a slight improvement in our RMSE by using elastic net regression. Next, we extract the top 50 most important predictors.
 
 ```{r}
 # Variable importance
 en_fit <- fit(en_final_wf, data = train_data)
 
+# Save the top 50 variable names
 top_50_vars <- en_fit |>
   extract_fit_parsnip() |>
-  vip(num_features = 50) 
+  vi(num_features = 50) |>
+  pull(Variable)
 
-top_50_vars
+# Visualize the plot
+en_fit |>
+  extract_fit_parsnip() |>
+  vip(num_features = 50)
 ```
 
 All our linear regression models employing feature engineering, selection, and regularization had similar RMSE outcomes. Next, to further improve RMSE, we adopt a more complex model that will be better at learning the non-linear patterns in the data.
@@ -563,9 +569,8 @@ tic()
 # Recipe
 model2_rec <- recipe(non_return_rate ~ ., data = train_data) |>
   # Specify and remove id variables
-  update_role(GIDTR, State_name, County_name, new_role = "id") |>
+  update_role(State_name, County_name, new_role = "id") |>
   # Remove highly redundant/correlated variables
-  step_rm(all_of(vars_to_drop)) |> 
   step_rm(has_role("id"),
           # Remove character variables 
           Aggr_House_Value_ACS_13_17, 
@@ -575,7 +580,7 @@ model2_rec <- recipe(non_return_rate ~ ., data = train_data) |>
           Low_Response_Score,
           Self_Response_Rate_ACS_13_17) |> 
   # Select the top 50 most important features from elastic net
-  step_select(top_50_vars) |>
+  step_select(all_of(top_50_vars), non_return_rate) |>
   # Impute median for missingness 
   step_impute_median(all_numeric_predictors())
 
@@ -614,6 +619,8 @@ collect_metrics(model2_resamples)
 toc()
 ```
 
+\
+
 ```{r}
 model2_resamples |>
   show_best()
@@ -622,6 +629,6 @@ model2_resamples |>
 autoplot(model2_resamples)
 ```
 
-In the top results, the tree depth varies widely, the cost complexity is very small, and the min_n is moderately large. These results suggest that the tree depth doesn't matter very much, but smaller cost complexity and splitting on moderate/large nodes are best.
+Our regression tree RMSE is not better than what we achieved using various linear regressions.
 
-\*Note to Miguel: I deleted the version of regression tree with a very long run time (12666.4 sec). In this now deleted version, I tried increasing the size of the grid to 100 to try more options, a different range for cost complexity, and a larger range of min_n. I also tried changing the order of my recipe steps to remove variables with low variance before imputation, and the threshold of step_corr to 0.75 instead of 0.9 since we already removed variables with high correlation. It had very little effect on RMSE. I welcome any changes to feature selection/engineering you want to add to improve Model 2, or just leave it as is.
+In the top results, the tree depth varies widely, the cost complexity is very small, and the min_n is moderately large. These results suggest that the tree depth doesn't matter very much, but smaller cost complexity and splitting on moderate/large nodes are best. Rather than tweaking our regression tree model to improve RMSE, we will attempt ensembling methods to improve out-of-sample performance.
