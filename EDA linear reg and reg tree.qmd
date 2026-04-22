@@ -1,0 +1,634 @@
+---
+title: "assignment07"
+author: "Sarah Krause and Miguel Villa"
+format: html
+editor: visual
+embed-resources: true
+---
+
+# Set up
+
+Read in the data and load libraries
+
+```{r message=FALSE, warning=FALSE}
+options(scipen = 999)
+
+library(tidyverse)
+library(here)
+library(tidymodels)
+library(skimr)
+library(janitor)
+library(corrplot)
+library(tictoc)
+library(vip)
+library(e1071)
+library(glmnet)
+
+data <- read.csv(here("data/assignment_modeling.csv"))
+```
+
+## Split the data
+
+```{r}
+set.seed(20260412)
+# Place 80% of the data in the training data
+split <- initial_split(data, prop = 0.8)
+
+# Obtain the training data
+train_data <- training(split)
+```
+
+## EDA on the training data
+
+### Basic Overview
+
+```{r}
+# Check Names
+names(train_data)
+
+# Glimpse the training data
+glimpse(train_data) 
+# We will have to remove the character variables: Aggregate_HH_INC_ACS_13_17, avg_Agg_HH_INC_ACS_13_17, Aggr_House_Value_ACS_13_17
+
+# Check the structure 
+str(train_data)
+
+# Examine missingness
+tibble(variable = names(train_data),
+       pct_missing = colMeans(is.na(train_data)) * 100) |>
+  arrange(desc(pct_missing))
+```
+
+### Outcome Variable
+
+```{r}
+# Basic Distribution of non_return_rate 
+summary(train_data$non_return_rate)
+
+# Non Missing of non_return_rate
+skim(train_data$non_return_rate)
+
+# Examine the distribution of non_return_rate
+train_data |>
+  ggplot(aes(x = non_return_rate)) +
+  geom_histogram() +
+  theme_minimal() +
+  labs(title = "Distribution of Non Return Rate") +
+  theme_minimal()
+
+# State Frequency of non return rate 
+train_data |>
+  group_by(State_name) |>
+  summarize(average_non = mean(non_return_rate),
+            count = n()) |>
+  arrange(desc(average_non))
+```
+
+### Look for variables highly correlated with outcome variable
+
+```{r}
+# Get correlation of numeric predictors with outcome variable
+correlations <- train_data |>
+  select(where(is.numeric)) |>
+  cor(use = "pairwise.complete.obs")
+
+# Extract just the correlations with the outcome
+outcome_cors <- correlations[, "non_return_rate"]
+
+# Sort in order of highest correlations
+outcome_cors_sorted <- sort(abs(outcome_cors), decreasing = TRUE)
+
+# Keep only correlations of 0.5 or higher
+outcome_cors_filtered <- outcome_cors_sorted[outcome_cors_sorted >= 0.5]
+
+outcome_cors_filtered
+```
+
+Low_response_score and self_response_rate are very similar to our outcome variable. We will remove them to prevent data leakage. Many of the variables that are correlated with the outcome variable are related to the breakdown of renters and owners in an area, and the demographic breakdowns.
+
+### Visualize the correlations
+
+```{r}
+# Percent owner occupied 
+train_data |>
+  ggplot(aes(x = non_return_rate, y = pct_Owner_Occp_HU_ACS_13_17)) +
+  geom_point(alpha = 0.25) +
+  theme_minimal()
+
+# Percent white alone
+train_data |>
+  ggplot(aes(x = non_return_rate, y = pct_NH_White_alone_CEN_2010)) +
+  geom_point(alpha = 0.25) +
+  theme_minimal()
+
+# Percent below poverty level
+train_data |>
+  ggplot(aes(x = non_return_rate, y = pct_Prs_Blw_Pov_Lev_ACS_13_17)) +
+  geom_point(alpha = 0.25) +
+  theme_minimal()
+```
+
+### Transformations of non_return_rate
+
+Here, we explore natural logarithm and logit transformations of non_return_rate.
+
+```{r}
+train_data |>
+  mutate(
+    raw_non   = non_return_rate,
+    log_non = log(non_return_rate + 0.001),
+    logit_non = log(non_return_rate/ (1 - non_return_rate + 0.001))) |>
+  pivot_longer(c(raw_non, log_non, logit_non)) |>
+  ggplot(aes(x = value)) +
+    geom_histogram() +
+    facet_wrap(~name, scales = "free") +
+    labs(title = "Non Return Rate Transformations") +
+    theme_minimal()
+```
+
+There are also other variables, in particular the income, home value, and population variables which could benefit from a log.
+
+The population variables are: Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17, Pop_under_5_CEN_2010, Pop_18_24_CEN_2010 Value: Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17 Otherss: pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17, pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17, pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010, pct_No_Plumb_ACS_13_17
+
+### Correlations
+
+Target Correlation: Typically you better features (non-target variables) that are highly correlated with target variables as they provide more predictive power.
+
+```{r}
+numeric_vars <- train_data |>
+  select(where(is.numeric), -non_return_rate)
+
+# find correlations
+correlations <- cor(numeric_vars, train_data$non_return_rate, use = "complete.obs") 
+  
+# Convert to dataframe and sort
+non_cor <- data_frame(
+  variable = rownames(correlations),
+  correlation = (correlations)) |>
+  arrange(desc(abs(correlation)))
+
+non_cor
+```
+
+One potential issue is a lot of these variables measure the same thing just in different survey (pct_NH_White_alone_CEN_2010, pct_NH_White_alone_ACS_13_17)
+
+Feature Correlation: One potential issue can be when features are highly correlated with one another. As one example, the percentage of families that speak Tagalog and Spanish may both contribute similar information to our model. The inclusion of both can lead to overfitting and make our estimates less stable. This issue doesn't matter as much for regularized models but does for regular regression.
+
+Here, we examine correlation clusters.
+
+```{r}
+corr_mat <- cor(numeric_vars, use = "pairwise.complete.obs")
+
+# distance based
+dist_mat <- as.dist(1 - abs(corr_mat))
+
+# hierarchical clustering
+hc <- hclust(dist_mat, method = "average")
+
+plot(hc, labels = FALSE, main = "Correlation Clusters")
+
+# Id'ing cluster
+clusters <- cutree(hc, h = 0.15)   # 1 - .85
+table(clusters)
+```
+
+There are way too many correlated features to even begin to count. We approach this issue by creating correlation clusters, and then keep one representative variable per each cluster to mitigate instances of high collinearity within predictor variables. We then create a list of “redundant variables” (vars_to_drop) that represent any excess variables within clusters. This cuts our number of predictors by roughly 100, and decreases the computational complexity of the model.
+
+```{r}
+# Now we'll attach cluster numbers to each variable
+cluster_df <- data.frame(
+  variable = names(numeric_vars),
+  cluster  = clusters)
+
+representatives <- cluster_df |>
+  group_by(cluster) |>
+  slice(1) |> 
+  pull(variable)
+
+vars_to_drop <- setdiff(cluster_df$variable, representatives)
+
+vars_to_drop
+```
+
+## Set up cross-validation and parallelization
+
+```{r}
+# 5 fold cross-validation
+folds <- vfold_cv(train_data, v = 5)
+```
+
+```{r}
+# Set up parallelization
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+```
+
+# Predictive Modeling
+
+## Model 1: Parametric
+
+### Plain Vanilla Linear Regression
+
+First, we try a "plain vanilla" linear regression model without removing the redundant variables we identified earlier. We remove character variables, variables that are similarly defined as our outcome variable, and a variable with a very high level of missingness. We use median imputation for the rest of the variables with missingness.
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  # Specify and remove id variables 
+  update_role(State_name, County_name,
+              new_role = "id") |>
+  # Remove other variables 
+  step_rm(has_role("id"),
+          # Remove character variables 
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          # Remove variables similar to the outcome variable
+          Self_Response_Rate_ACS_13_17,
+          Low_Response_Score,
+          # Remove variable with high missingness
+          pct_TEA_Update_Leave_CEN_2010) |> 
+  # Median imputation for other variables with missingness 
+  step_impute_median(all_numeric_predictors())
+
+prep(model1_rec) |> juice() |> names()
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+model0_resamples <- model0_wf |>
+  fit_resamples(resamples = folds)
+
+model0_resamples |>
+  collect_metrics()
+```
+
+Next, we extract the 20 most important predictor variables from our linear regression model.
+
+```{r}
+# Variable importance
+model0_final <- model0_wf |>
+  last_fit(split) 
+
+model0_final |>
+  extract_fit_parsnip() |>
+  vip(num_features = 20) 
+
+#Extracting the most important for later use 
+fit <- model0_final |> 
+  extract_fit_parsnip()
+
+imp_tbl <- vi(fit)
+
+# sort by absolute importance
+imp_tbl <- imp_tbl |> arrange(desc(abs(Importance)))
+
+# convert to a vector of variable names
+top_vars <- imp_tbl$Variable[1:20]
+
+top_vars
+
+top_vars_clean <- intersect(top_vars, names(train_data))
+```
+
+### Linear regression, removing redundant features
+
+Then, we try another linear regression model, this time we remove the redundant variables we identified earlier. Same as the "plain vanilla" linear regression, we remove character variables, variables that are similarly defined as our outcome variable, and a variable with a very high level of missingness. We use median imputation for the rest of the variables with missingness.
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+    # Specify and remove id variables 
+  update_role(State_name, County_name,
+              new_role = "id") |>
+  # Remove other variables 
+  step_rm(has_role("id"),
+          # Remove character variables 
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          # Remove variables similar to the outcome variable
+          Self_Response_Rate_ACS_13_17,
+          Low_Response_Score) |>
+  # Remove redundant/highly correlated predictors 
+  step_rm(all_of(vars_to_drop)) |> 
+  # Median imputation for other variables with missingness 
+  step_impute_median(all_numeric_predictors())
+
+prep(model1_rec) |> 
+  juice() |> 
+  names()
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+model0_resamples <- model0_wf |>
+  fit_resamples(resamples = folds)
+
+model0_resamples |>
+  collect_metrics()
+```
+
+Removing redundant variables did not change the RMSE.
+
+### Linear regression model with transformations
+
+Next, we try a third linear regression model, with the only change from the previous model being that we apply natural logarithmic transformations of the following variables:
+
+-   Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17
+
+-   Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17
+
+-   pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17, pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17, pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010, pct_No_Plumb_ACS_13_17
+
+We also normalize all predictors.
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  # Specify and remove id variables 
+  update_role(State_name, County_name,
+              new_role = "id") |>
+  # Remove other variables
+  step_rm(has_role("id"),
+          # Remove character variables 
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          # Remove variables similar to the outcome variable
+          Self_Response_Rate_ACS_13_17,
+          Low_Response_Score) |> 
+  # Apply log transformations 
+  step_log(Tot_Population_ACS_13_17, Males_ACS_13_17, Females_ACS_13_17, offset = 1) |>
+  step_log(Med_HHD_Inc_ACS_13_17, Med_House_Value_ACS_13_17, offset = 1) |>
+  step_log(pct_Age5p_French_ACS_13_17, pct_College_ACS_13_17,
+           pct_Prs_Blw_Pov_Lev_ACS_13_17, pct_TwoPHealthIns_ACS_13_17,
+           pct_Female_No_HB_CEN_2010, pct_Sngl_Prns_HHD_CEN_2010,
+           pct_No_Plumb_ACS_13_17, offset = 1e-6) |>
+  # Remove redundant/highly correlated predictors 
+  step_rm(all_of(vars_to_drop)) |> 
+  # Impute with median for numeric predictors' missing values
+  step_impute_median(all_numeric_predictors()) |>
+  # Normalize all predictors 
+  step_normalize(all_numeric_predictors()) 
+
+prep(model1_rec) |> juice() |> names()
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+model0_resamples <- model0_wf |>
+  fit_resamples(resamples = folds)
+
+model0_resamples |>
+  collect_metrics()
+
+model0_final <- model0_wf |>
+  last_fit(split) |>
+  collect_metrics()
+```
+
+Applying log transformations did not improve the RMSE.
+
+### Linear Regression with PCA hyperparameter tuning
+
+Given the large number of variables in this dataset, we apply a principal component analysis (PCA) tuning grid. PCA can be especially helpful for this task because it handles multicollinearity, reduces overfitting, and reduces the number of predictors, which saves computational expense. Our tuning grid tunes over a range of 50 to 150 principal components.
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+model1_rec <- recipe(non_return_rate ~ ., train_data) |>
+  # Specify and remove id variables
+  update_role(State_name, County_name,
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          # Remove variable with high missingness
+          pct_TEA_Update_Leave_CEN_2010,
+          # Remove character variables 
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          # Remove variables similar to the outcome variable 
+          Self_Response_Rate_ACS_13_17,
+          Low_Response_Score) |> 
+  # Impute median for numeric predictors 
+  step_impute_median(all_numeric_predictors()) |>
+  # Normalize all predictors
+  step_normalize(all_numeric_predictors()) |>
+  # Apply PCA hyperparameter tuning 
+  step_pca(all_numeric_predictors(), num_comp = tune::tune())
+
+model0_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+model0_wf <- workflow() |>
+  add_recipe(model1_rec) |>
+  add_model(model0_mod)
+
+# Add PCA grid
+pca_grid <- grid_regular(
+  num_comp(range = c(50, 150)),
+  levels = 10)
+
+model0_resamples <- tune_grid(
+  model0_wf,
+  resamples = folds,
+  grid = pca_grid)
+
+model0_resamples |>
+  collect_metrics()
+```
+
+Our RMSE remains high for the levels of PCA tried in the grid.
+
+### Elastic Net
+
+Next, we try applying elastic net regularization with hyperparameter tuning for both the penalty and the mixture. Our motivation is to try to improve the linear regression model's generalization to unseen data.
+
+```{r}
+set.seed(20260412)
+
+# Recipe
+en_rec <- recipe(non_return_rate ~ ., train_data) |>
+  # Specify and remove id variables
+  update_role(State_name, County_name,
+              new_role = "id") |>
+  step_rm(has_role("id"),
+          # Remove variable with high missingness
+          pct_TEA_Update_Leave_CEN_2010,
+          # Remove character variables 
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          Aggregate_HH_INC_ACS_13_17,
+          # Remove variables similar to the outcome variable 
+          Self_Response_Rate_ACS_13_17,
+          Low_Response_Score) |> 
+  # Impute median for numeric predictors 
+  step_impute_median(all_numeric_predictors()) |>
+  # Normalize all predictors
+  step_normalize(all_numeric_predictors())
+
+# Mode
+en_mode <- linear_reg(penalty = tune(), mixture = tune()) |> # works best for many variables 
+  set_mode(mode = "regression") |>
+  set_engine(engine = "glmnet") 
+
+# Workflow
+en_wf <- workflow() |>
+  add_recipe(en_rec) |>
+  add_model(en_mode)
+
+# Resamples
+en_grid <- grid_regular(
+  penalty(), 
+  mixture(),
+  levels = 20
+)
+
+# Tuning grid
+en_tuning <- tune_grid(
+  en_wf,
+  resamples = folds,
+  grid = en_grid
+)
+
+show_best(en_tuning)
+
+# Finalize workflow
+en_best <- select_best(en_tuning, metric = "rmse")
+
+en_final_wf <- finalize_workflow(
+  en_wf,
+  en_best)
+```
+
+We do see a slight improvement in our RMSE by using elastic net regression. Next, we extract the top 50 most important predictors.
+
+```{r}
+# Variable importance
+en_fit <- fit(en_final_wf, data = train_data)
+
+# Save the top 50 variable names
+top_50_vars <- en_fit |>
+  extract_fit_parsnip() |>
+  vi(num_features = 50) |>
+  pull(Variable)
+
+# Visualize the plot
+en_fit |>
+  extract_fit_parsnip() |>
+  vip(num_features = 50)
+```
+
+All our linear regression models employing feature engineering, selection, and regularization had similar RMSE outcomes. Next, to further improve RMSE, we adopt a more complex model that will be better at learning the non-linear patterns in the data.
+
+## Model 2: Regression tree (Non-parametric)
+
+For our second type of model, we have selected a regression tree, a non-parametric approach. We tune the following three regression tree hyperparameters:
+
+-   Cost complexity - balances accuracy with tree size
+
+-   Tree depth - the length from the root node to the farthest leaf
+
+-   min_n - the minimum number of data points a node must contain before further splitting
+
+After removing "id" variables, character variables, and variables highly similar to the outcome variable, we select only the top 50 most important features from elastic net regression to reduce computational expense.
+
+```{r}
+set.seed(20260414)
+tic()
+# Recipe
+model2_rec <- recipe(non_return_rate ~ ., data = train_data) |>
+  # Specify and remove id variables
+  update_role(State_name, County_name, new_role = "id") |>
+  # Remove highly redundant/correlated variables
+  step_rm(has_role("id"),
+          # Remove character variables 
+          Aggr_House_Value_ACS_13_17, 
+          avg_Agg_HH_INC_ACS_13_17,
+          avg_Agg_House_Value_ACS_13_17, 
+          # Remove variables similar to the outcome variable 
+          Low_Response_Score,
+          Self_Response_Rate_ACS_13_17) |> 
+  # Select the top 50 most important features from elastic net
+  step_select(all_of(top_50_vars), non_return_rate) |>
+  # Impute median for missingness 
+  step_impute_median(all_numeric_predictors())
+
+# Model
+model2_mod <- decision_tree(
+    cost_complexity = tune(),
+    tree_depth = tune(),
+    min_n = tune()
+  ) |>
+  set_engine(engine = "rpart") |>
+  set_mode(mode = "regression")
+
+# Tuning grid
+model2_grid <- grid_space_filling(
+  cost_complexity(range = c(-5, -1)), 
+  tree_depth(range = c(3, 15)), 
+  min_n(range = c(2, 50)),
+  size = 20
+)
+
+# Workflow
+model2_wf <-
+  workflow() |>
+  add_recipe(recipe = model2_rec) |>
+  add_model(spec = model2_mod)
+
+# Resamples
+model2_resamples <- model2_wf |>
+  tune_grid(resamples = folds,
+            grid = model2_grid,
+            metrics = metric_set(rmse),
+            control = control_grid(parallel_over = "everything"))
+
+# Collect metrics
+collect_metrics(model2_resamples)
+toc()
+```
+
+\
+
+```{r}
+model2_resamples |>
+  show_best()
+
+# Visualize the results
+autoplot(model2_resamples)
+```
+
+Our regression tree RMSE is not better than what we achieved using various linear regressions.
+
+In the top results, the tree depth varies widely, the cost complexity is very small, and the min_n is moderately large. These results suggest that the tree depth doesn't matter very much, but smaller cost complexity and splitting on moderate/large nodes are best. Rather than tweaking our regression tree model to improve RMSE, we will attempt ensembling methods to improve out-of-sample performance.
