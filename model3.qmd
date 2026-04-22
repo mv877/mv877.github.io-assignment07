@@ -1,5 +1,5 @@
 ---
-title: "Model 3"
+title: "Model 3 Ensembling"
 author: "Sarah Krause and Miguel Villa"
 format: html
 editor: visual
@@ -75,6 +75,9 @@ vars_to_drop <- setdiff(cluster_df$variable, representatives)
 
 
 ### Random Forrest Model 1
+For our third model, we have will first try random forest, an ensembling approach. We tune the hyperparameters *min_n*, the minimum number of data points required in a node before further splitting, and *mtry*, the number of predictors considered at each split using the latin hypercube tuning grid to save computation time. For *min_n*, we tune over a range of 5 to 40 data points required in a node before further splitting. For *mtry,* we tune over a range of 5 to 50 predictors to be considered at each split. During tuning, we use 100 trees. The number of trees will be increased to between 200-500 for final model fitting. We also use parallelization to reduce computation time.
+
+In the recipe, several variables are removed, as well as variables with low variance and high correlation with each other. These steps reduce redundancy and also save computation time. We also use 3-fold cross-validation instead of 5-fold cross-validation.
 
 ```{r message=FALSE, warning=FALSE}
 #| freeze: true
@@ -134,7 +137,9 @@ best_rf <- select_best(model3_resamples, metric = "rmse")
 # Finalize and fit 
 final_rf_wf <- finalize_workflow(model3_wf, best_rf)
 
-final_rf_fit <- fit(final_rf_wf, data = train_data)
+final_rf_fit <- last_fit(final_rf_wf, split = split)
+
+
 
 ```
 
@@ -144,6 +149,7 @@ collect_metrics(final_rf_fit)
 ```
 
 ### XGB Model
+An XG Boost model is our final model and is consider for it's considerable benefits in terms of bias reduction as a model that sequential fits predictive models on the previous iteration of the sequence. Typically this means the model is fit on the residual of the previous models. 
 
 ```{r message=FALSE, warning=FALSE}
 #| freeze: true
@@ -180,8 +186,8 @@ xgb_spec <- boost_tree(
   sample_size = tune(), mtry = tune(),
   learn_rate = tune()) |>
   set_engine("xgboost", 
-             validation = 0.1,      # holds out 10% to monitor early stopping
-             nthread = 1) |>        # 1 thread per model since we parallelize across folds
+             validation = 0.1,      
+             nthread = 1) |>       
   set_mode("regression")
 
 xgb_grid <- grid_latin_hypercube(
